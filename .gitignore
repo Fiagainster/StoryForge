@@ -1,0 +1,15 @@
+# 依赖与构建产物
+app/node_modules/
+app/dist/
+app/src-tauri/target/
+
+# 引擎工作区（ComfyUI 内核 + 运行环境，1.7G，独立安装不入库）
+app/engine/
+
+# 自测产物与临时文件
+.workbuddy/shots/
+.workbuddy/tmp/
+
+# 系统
+Thumbs.db
+.DS_Store
