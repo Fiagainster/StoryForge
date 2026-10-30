@@ -98,6 +98,9 @@ interface Store {
   error: string | null;
   /** 最近一轮发给模型的系统提示词，供人工审查 */
   lastPrompt: string | null;
+  /** 画布上「＋N 可选」被手动展开的节点：随工程走（以前只存本机） */
+  expandedIds: string[];
+  setExpandedIds: (ids: string[]) => void;
   /** 多会话：每个会话有独立的消息流与执行历史 */
   sessions: ChatSession[];
   activeId: string;
@@ -169,6 +172,8 @@ interface Store {
   exportRunAssets: (runId: string) => Promise<void>;
   /** 把这一版的分镜表（镜号/景别/运镜/台词/时长）导出成 CSV，进项目 export/ */
   exportStoryboard: (runId: string) => Promise<void>;
+  /** 把 output/ 里没被任何执行记录引用的冒烟测试产物移进 _trash（不真删） */
+  cleanupTestOutputs: () => Promise<void>;
   /** 自我完善：把一条经验沉淀进配置，之后出计划都会带上 */
   addLearning: (lesson: string) => Promise<void>;
   clearLearnings: () => Promise<void>;
@@ -281,6 +286,7 @@ function snapshotOf(s: Store): string | null {
       sessions: s.sessions,
       activeId: s.activeId,
       lastPrompt: s.lastPrompt,
+      expanded: s.expandedIds,
       savedAt: Date.now(),
     },
     null,
@@ -313,7 +319,7 @@ const PROJECT_POINTER_KEY = "storyforge.project.v1";
 function sanitizeLoaded(
   data: any,
   port: number
-): { sessions: ChatSession[]; activeId: string; draft: CanvasDoc } | null {
+): { sessions: ChatSession[]; activeId: string; draft: CanvasDoc; expanded: string[] | null } | null {
   try {
     const rebase = (u: string) =>
       String(u).replace(/127[.]0[.]0[.]1:[0-9]+/, `127.0.0.1:${port}`);
@@ -377,15 +383,32 @@ function sanitizeLoaded(
         ? data.activeId
         : sessions[sessions.length - 1].id,
       draft,
+      // 折叠状态以前只存本机 localStorage；现在随工程走，老档没有就返回 null 让调用方迁移
+      expanded: Array.isArray(data.expanded)
+        ? data.expanded.filter((x: unknown): x is string => typeof x === "string")
+        : null,
     };
   } catch {
     return null;
   }
 }
 
+/** 旧版折叠状态只存在本机 localStorage：迁移一次进工程，读完即清 */
+function seedExpandedFromLocal(): string[] {
+  try {
+    const raw = localStorage.getItem("sf.expand");
+    if (raw === null) return [];
+    localStorage.removeItem("sf.expand");
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr.filter((x): x is string => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
 function loadPersisted(
   port: number
-): { sessions: ChatSession[]; activeId: string; draft: CanvasDoc } | null {
+): { sessions: ChatSession[]; activeId: string; draft: CanvasDoc; expanded: string[] | null } | null {
   try {
     const raw = localStorage.getItem(SESSIONS_KEY);
     if (!raw) return null;
@@ -584,6 +607,7 @@ export const useStore = create<Store>((set, get) => {
   tab: "graph",
   error: null,
   lastPrompt: null,
+  expandedIds: [],
   sessions: [initialSession],
   activeId: initialSession.id,
   projects: [],
@@ -601,6 +625,12 @@ export const useStore = create<Store>((set, get) => {
 
   setTab: (tab) => set({ tab }),
   clearError: () => set({ error: null }),
+
+  setExpandedIds: (ids) => {
+    set({ expandedIds: [...new Set(ids)].slice(0, 200) });
+    // 全局订阅只盯 messages/runs/draft，折叠状态的变化要自己触发落盘
+    if (get().project) saveProjectSoon(get());
+  },
 
   init: async () => {
     // StrictMode 下 effect 会连跑两次：第二次直接返回，别把初始化做重
@@ -621,6 +651,8 @@ export const useStore = create<Store>((set, get) => {
           messages: active.messages,
           runs: active.runs,
           lastPrompt: active.lastPrompt ?? null,
+          // 折叠状态：工程档里有就用；老档没有就从 localStorage 迁移一次
+          expandedIds: persisted.expanded ?? seedExpandedFromLocal(),
           // 上次的"AI 刚改过"是上一场的事：重启后不该还挂着，
           // 也不该把"正在跑"残留成真的在跑
           draft: persisted.draft
@@ -1732,6 +1764,7 @@ export const useStore = create<Store>((set, get) => {
         messages: (loaded?.sessions ?? []).find((x) => x.id === loaded?.activeId)?.messages ?? [],
         runs: (loaded?.sessions ?? []).find((x) => x.id === loaded?.activeId)?.runs ?? [],
         lastPrompt: (loaded?.sessions ?? []).find((x) => x.id === loaded?.activeId)?.lastPrompt ?? null,
+        expandedIds: loaded?.expanded ?? seedExpandedFromLocal(),
         draft,
         tab: "graph",
         error: null,
@@ -1772,6 +1805,7 @@ export const useStore = create<Store>((set, get) => {
         messages: fresh.messages,
         runs: [],
         lastPrompt: null,
+        expandedIds: [],
         draft: starterDoc(),
         tab: "graph",
         error: null,
@@ -1804,6 +1838,7 @@ export const useStore = create<Store>((set, get) => {
             messages: fresh.messages,
             runs: [],
             lastPrompt: null,
+            expandedIds: [],
             draft: starterDoc(),
           });
           localStorage.removeItem(PROJECT_POINTER_KEY);
@@ -1917,6 +1952,51 @@ export const useStore = create<Store>((set, get) => {
       get().addLog("info", `分镜表已导出到项目 export/：${path}`);
     } catch (e) {
       get().addLog("error", `分镜表导出失败：${e}`);
+    }
+  },
+
+  cleanupTestOutputs: async () => {
+    if (get().busy) return;
+    try {
+      const files = await api.comfyOutputList();
+      // 冒烟测试用的 demo_/test_/final_check_/scratch_ 这类前缀才进候选；
+      // 正式产物（storyforge/shotNN_*、storyforge/film/ 成片）的 stem 不匹配白名单，
+      // 再加上"被任何执行记录引用过就跳过"双保险，跨工程的真实产物不会被误伤。
+      const TEST_RE = /^(demo|test|progress_test|final_check|scratch|progress|concat_test)[_\-]?\d*/i;
+      const referenced = new Set(
+        get()
+          .sessions.flatMap((x) => x.runs)
+          .flatMap((r) => r.assets.map((a) => `${(a.subfolder || "").replace(/\\/g, "/")}/${a.filename ?? ""}`))
+      );
+      const cands = files.filter((f) => {
+        const path = `${(f.subfolder || "").replace(/\\/g, "/")}/${f.filename}`;
+        if (path.startsWith("_trash/") || path.startsWith("storyforge/film/")) return false;
+        const stem = f.filename.replace(/\.[^.]+$/, "");
+        return TEST_RE.test(stem) && !referenced.has(path);
+      });
+      if (!cands.length) {
+        get().addLog("info", "没有可清理的测试产物，输出目录很干净。");
+        return;
+      }
+      const mb = cands.reduce((n, f) => n + f.bytes, 0) / 1024 / 1024;
+      const ok = window.confirm(
+        `发现 ${cands.length} 个没被任何执行记录引用的测试产物（共 ${mb.toFixed(1)} MB）。\n` +
+          "它们会被移进 output/_trash/（不真删，随时可捞回）。\n\n" +
+          cands
+            .slice(0, 8)
+            .map((f) => `· ${f.subfolder ? f.subfolder + "/" : ""}${f.filename}`)
+            .join("\n") +
+          (cands.length > 8 ? `\n…等 ${cands.length} 个` : "") +
+          "\n\n确定清理吗？"
+      );
+      if (!ok) return;
+      const r = await api.comfyOutputTrash(cands);
+      get().addLog(
+        "info",
+        `已把 ${r.moved} 个测试产物（${(r.bytes / 1024 / 1024).toFixed(1)} MB）移进 output/_trash/。`
+      );
+    } catch (e) {
+      get().addLog("error", `清理测试产物失败：${e}`);
     }
   },
   };

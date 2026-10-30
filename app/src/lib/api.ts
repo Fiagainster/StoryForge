@@ -18,6 +18,24 @@ export const comfyStop = () => invoke<Record<string, unknown>>("comfy_stop");
 /** 产物在磁盘上的真实目录：引擎关掉后仍能直接读文件，不靠 /view */
 export const comfyOutputDir = () => invoke<string>("comfy_output_dir");
 
+export interface OutFile {
+  filename: string;
+  subfolder: string;
+  bytes: number;
+}
+
+export interface CleanupResult {
+  moved: number;
+  bytes: number;
+}
+
+/** 递归列出 output/ 下所有文件（跳过 _trash），筛测试产物用 */
+export const comfyOutputList = () => invoke<OutFile[]>("comfy_output_list");
+
+/** 把指定文件移进 output/_trash/——不真删，可恢复 */
+export const comfyOutputTrash = (items: OutFile[]) =>
+  invoke<CleanupResult>("comfy_output_trash", { items });
+
 export interface LlmUsage {
   prompt_tokens?: number;
   completion_tokens?: number;

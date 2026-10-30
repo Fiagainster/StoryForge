@@ -397,6 +397,133 @@ fn comfy_output_dir(app: tauri::AppHandle) -> Result<String, String> {
     Ok(dir.to_string_lossy().to_string())
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct OutFile {
+    filename: String,
+    subfolder: String,
+    bytes: u64,
+}
+
+#[derive(serde::Serialize)]
+struct CleanupResult {
+    moved: usize,
+    bytes: u64,
+}
+
+/// 递归列出 output/ 下所有文件（跳过 _trash 回收目录），
+/// 给前端筛"没被任何执行记录引用的测试产物"用。
+#[tauri::command]
+fn comfy_output_list(app: tauri::AppHandle) -> Result<Vec<OutFile>, String> {
+    let cfg = load_config(&app);
+    let root = detect_root(&cfg);
+    let dir = resolve(&cfg, &root, "comfyBase").join("output");
+    if !dir.is_dir() {
+        return Ok(vec![]);
+    }
+    let mut out = Vec::new();
+    let mut stack = vec![(dir, String::new())];
+    while let Some((d, sub)) = stack.pop() {
+        for entry in std::fs::read_dir(&d).map_err(|e| e.to_string())?.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                let name = p
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                if name == "_trash" {
+                    continue;
+                }
+                let next_sub = if sub.is_empty() {
+                    name
+                } else {
+                    format!("{sub}/{name}")
+                };
+                stack.push((p, next_sub));
+            } else if p.is_file() {
+                let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                out.push(OutFile {
+                    filename: p
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string(),
+                    subfolder: sub.clone(),
+                    bytes,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 把指定的产物文件移进 output/_trash/（保留来源标记，重名带序号）——
+/// 不真删文件，清理错了随时能从 _trash 捞回来。
+#[tauri::command]
+fn comfy_output_trash(app: tauri::AppHandle, items: Vec<OutFile>) -> Result<CleanupResult, String> {
+    let cfg = load_config(&app);
+    let root = detect_root(&cfg);
+    let dir = resolve(&cfg, &root, "comfyBase").join("output");
+    if !dir.is_dir() {
+        return Err("输出目录不存在".into());
+    }
+    let dir_canon = dir.canonicalize().map_err(|e| e.to_string())?;
+    let trash = dir.join("_trash");
+    let path_safe = |s: &str| {
+        !s.is_empty()
+            && !s.contains("..")
+            && !s.contains(':')
+            && !s.starts_with('/')
+            && !s.starts_with('\\')
+    };
+    let mut moved = 0usize;
+    let mut bytes = 0u64;
+    for it in items {
+        // 严防路径逃逸：subfolder 不允许带 .. 或盘符，filename 只允许纯文件名
+        if !path_safe(&it.subfolder)
+            || it.filename.is_empty()
+            || it.filename.contains('/')
+            || it.filename.contains('\\')
+            || it.filename.contains("..")
+        {
+            continue;
+        }
+        let src = dir.join(&it.subfolder).join(&it.filename);
+        let src = match src.canonicalize() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if !src.starts_with(&dir_canon) || !src.is_file() {
+            continue;
+        }
+        let dest_dir = trash.join(if it.subfolder.is_empty() {
+            "root".to_string()
+        } else {
+            it.subfolder.replace(['/', '\\'], "_")
+        });
+        std::fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
+        let mut dest = dest_dir.join(&it.filename);
+        let mut n = 2;
+        while dest.exists() {
+            let stem = std::path::Path::new(&it.filename)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "file".into());
+            let ext = std::path::Path::new(&it.filename)
+                .extension()
+                .map(|e| format!(".{}", e.to_string_lossy()))
+                .unwrap_or_default();
+            dest = dest_dir.join(format!("{stem}_{n}{ext}"));
+            n += 1;
+        }
+        if std::fs::rename(&src, &dest).is_ok() {
+            moved += 1;
+            bytes += it.bytes;
+        }
+    }
+    Ok(CleanupResult { moved, bytes })
+}
+
 /* ---------------- 项目（工程文件夹）：一个项目一个真实文件夹 ---------------- */
 
 /// 项目根目录：config.json 里的 projectsRoot 优先，否则默认 文档/StoryForgeProjects
@@ -1042,6 +1169,8 @@ pub fn run() {
             comfy_start,
             comfy_stop,
             comfy_output_dir,
+            comfy_output_list,
+            comfy_output_trash,
             llm_chat,
             llm_chat_stream,
             llm_abort,

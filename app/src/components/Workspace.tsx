@@ -708,8 +708,11 @@ function LegacyRun({ run, onZoom }: { run: RunRecord; onZoom: (a: Asset, list: A
 }
 
 /* ------------------------------------------------------------------ *
- * 多版对比：同一个计划跑了几版，并排看同一镜的差别
+ * 多版对比：同一个计划跑了几版，并排看同一镜的差别；
+ * 闪烁模式把同一镜的几版塞进同一个视口轮播——差别是动态的，一眼看得出
  * ------------------------------------------------------------------ */
+
+const FLICKER_MS = 1200;
 
 function CompareBoard({
   runs,
@@ -718,89 +721,221 @@ function CompareBoard({
   runs: RunRecord[];
   onZoom: (a: Asset, list: Asset[]) => void;
 }) {
-  const rows = Math.max(...runs.map((r) => r.plan!.shots.length));
-  return (
-    <div
-      className="grid justify-start gap-2.5"
-      style={{ gridTemplateColumns: `34px repeat(${runs.length}, minmax(0, 232px))` }}
-    >
-      <div />
-      {runs.map((r, i) => (
-        <div
-          key={r.id}
-          className="min-w-0 rounded-[10px] bg-[var(--bg-1)] px-2.5 py-2 shadow-[inset_0_0_0_0.5px_var(--line-1)]"
-        >
-          <div className="flex items-center gap-1.5">
-            <span className="truncate t-12 text-[var(--fg-1)]">
-              {i === 0 ? "最新一版" : `往前第 ${i + 1} 版`}
-            </span>
-            {i === 0 ? <Tag tone="accent">最新</Tag> : null}
-          </div>
-          <div className="mt-0.5 flex items-center gap-1.5 t-11 tabular text-[var(--fg-4)]">
-            <span className="font-mono">{r.id}</span>
-            <Dot />
-            <span>
-              {new Date(r.startedAt).toLocaleString("zh-CN", {
-                month: "2-digit",
-                day: "2-digit",
-                hour: "2-digit",
-                minute: "2-digit",
-              })}
-            </span>
-            <Dot />
-            <span>{r.plan!.shots.length} 镜</span>
-          </div>
-        </div>
-      ))}
+  const [flicker, setFlicker] = useState(false);
+  /** 闪烁时钟：整块棋盘共用一个 tick，便宜且各行同步 */
+  const [tick, setTick] = useState(0);
+  /** 定格的行：点「定格」时记下当时的版号，停在那一版；再点恢复轮播 */
+  const [frozen, setFrozen] = useState<Record<number, number>>({});
+  useEffect(() => {
+    if (!flicker) return;
+    const t = window.setInterval(() => setTick((n) => n + 1), FLICKER_MS);
+    return () => window.clearInterval(t);
+  }, [flicker]);
+  /** 退出闪烁模式时清掉定格，下次进来从干净状态开始 */
+  useEffect(() => {
+    if (!flicker) setFrozen({});
+  }, [flicker]);
 
-      {Array.from({ length: rows }).map((_, row) => (
-        <Fragment key={row}>
-          <div className="pt-2 t-11 tabular text-[var(--fg-4)]">{pad(row + 1)}</div>
-          {runs.map((r) => {
-            const shot = r.plan!.shots[row];
-            const frame = shotFrame(r, row + 1);
-            const video = shotVideo(r, row + 1);
+  const rows = Math.max(...runs.map((r) => r.plan!.shots.length));
+
+  /** 这一镜这个时刻显示第几版：跳过这一版没有的镜，轮到有产出的那版 */
+  const visibleIdx = (row: number) => {
+    let i = tick % runs.length;
+    for (let n = 0; n < runs.length; n++) {
+      const cand = (i + n) % runs.length;
+      if (shotFrame(runs[cand], row + 1) || shotVideo(runs[cand], row + 1)) return cand;
+    }
+    return -1;
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center gap-1.5">
+        {(["并排", "闪烁"] as const).map((m) => {
+          const on = (m === "闪烁") === flicker;
+          return (
+            <button
+              key={m}
+              data-active={on ? "1" : "0"}
+              onClick={() => setFlicker(m === "闪烁")}
+              className="rounded-full px-2.5 py-0.5 t-11 text-[var(--fg-2)] transition-colors hover:text-[var(--fg-1)] data-[active=1]:bg-[var(--bg-3)] data-[active=1]:text-[var(--fg-1)]"
+            >
+              {m}
+            </button>
+          );
+        })}
+        {flicker ? (
+          <span className="t-11 text-[var(--fg-4)]">
+            同一镜的几版每 {(FLICKER_MS / 1000).toFixed(1)}s 轮一版；点「定格」停住看细节
+          </span>
+        ) : null}
+      </div>
+      <div
+        className="grid justify-start gap-2.5"
+        style={{
+          gridTemplateColumns: flicker
+            ? `34px repeat(1, minmax(0, 300px))`
+            : `34px repeat(${runs.length}, minmax(0, 232px))`,
+        }}
+      >
+        <div />
+        {flicker ? (
+          <div className="rounded-[10px] bg-[var(--bg-1)] px-2.5 py-2 t-11 text-[var(--fg-4)] shadow-[inset_0_0_0_0.5px_var(--line-1)]">
+            轮播中 · 最新在前
+          </div>
+        ) : (
+          runs.map((r, i) => (
+            <div
+              key={r.id}
+              className="min-w-0 rounded-[10px] bg-[var(--bg-1)] px-2.5 py-2 shadow-[inset_0_0_0_0.5px_var(--line-1)]"
+            >
+              <div className="flex items-center gap-1.5">
+                <span className="truncate t-12 text-[var(--fg-1)]">
+                  {i === 0 ? "最新一版" : `往前第 ${i + 1} 版`}
+                </span>
+                {i === 0 ? <Tag tone="accent">最新</Tag> : null}
+              </div>
+              <div className="mt-0.5 flex items-center gap-1.5 t-11 tabular text-[var(--fg-4)]">
+                <span className="font-mono">{r.id}</span>
+                <Dot />
+                <span>
+                  {new Date(r.startedAt).toLocaleString("zh-CN", {
+                    month: "2-digit",
+                    day: "2-digit",
+                    hour: "2-digit",
+                    minute: "2-digit",
+                  })}
+                </span>
+                <Dot />
+                <span>{r.plan!.shots.length} 镜</span>
+              </div>
+            </div>
+          ))
+        )}
+
+        {Array.from({ length: rows }).map((_, row) => {
+          if (flicker) {
+            // 定格的行停在点下那一刻的版上；没定格的按时钟轮播
+            const idx = frozen[row] !== undefined ? frozen[row] : visibleIdx(row);
+            const r = idx >= 0 ? runs[idx] : null;
+            const shot = r ? r.plan!.shots[row] : null;
+            const frame = r ? shotFrame(r, row + 1) : undefined;
+            const video = r ? shotVideo(r, row + 1) : undefined;
             const open = video || frame;
-            const list = r.plan!.shots
-              .map((_, i) => shotVideo(r, i + 1) || shotFrame(r, i + 1))
-              .filter(Boolean) as Asset[];
+            const list = r
+              ? (r.plan!.shots
+                  .map((_, i) => shotVideo(r, i + 1) || shotFrame(r, i + 1))
+                  .filter(Boolean) as Asset[])
+              : [];
             return (
-              <div key={`${r.id}-${row}`} className="min-w-0">
-                {open ? (
-                  <div
-                    onClick={() => onZoom(open, list)}
-                    className="group relative cursor-zoom-in overflow-hidden rounded-[10px] bg-[var(--bg-base)] shadow-[inset_0_0_0_0.5px_var(--line-1)]"
-                    style={{ aspectRatio: "9 / 16" }}
-                  >
-                    {video ? (
-                      <div className="grid size-full place-items-center text-[var(--fg-3)]">
-                        {I.play(16)}
+              <Fragment key={row}>
+                <div className="pt-2 t-11 tabular text-[var(--fg-4)]">{pad(row + 1)}</div>
+                <div className="min-w-0">
+                  <div className="relative">
+                    {open ? (
+                      <div
+                        onClick={() => onZoom(open, list)}
+                        className="relative cursor-zoom-in overflow-hidden rounded-[10px] bg-[var(--bg-base)] shadow-[inset_0_0_0_0.5px_var(--line-1)]"
+                        style={{ aspectRatio: "9 / 16" }}
+                      >
+                        {video ? (
+                          <div className="grid size-full place-items-center text-[var(--fg-3)]">
+                            {I.play(18)}
+                          </div>
+                        ) : (
+                          <img
+                            key={`${r!.id}-${row}`}
+                            src={mediaSrc(frame!)}
+                            alt={shot?.title || ""}
+                            className="size-full object-cover"
+                          />
+                        )}
                       </div>
                     ) : (
-                      <img
-                        src={mediaSrc(frame)}
-                        alt={shot?.title || ""}
-                        loading="lazy"
-                        className="size-full object-cover transition-transform duration-500 ease-out group-hover:scale-[1.02]"
-                      />
+                      <div
+                        className="grid place-items-center rounded-[10px] bg-[var(--bg-1)] t-11 text-[var(--fg-4)] shadow-[inset_0_0_0_0.5px_var(--line-1)]"
+                        style={{ aspectRatio: "9 / 16" }}
+                      >
+                        {shot ? "未生成" : "—"}
+                      </div>
                     )}
+                    <div className="pointer-events-none absolute left-1.5 top-1.5 flex items-center gap-1">
+                      <span className="rounded-full bg-black/55 px-1.5 py-px t-10 text-white">
+                        {idx >= 0 ? (idx === 0 ? "最新" : `-${idx}`) : "—"}
+                      </span>
+                    </div>
+                    <button
+                      onClick={() =>
+                        setFrozen((f) => {
+                          const n = { ...f };
+                          if (n[row] === undefined) n[row] = idx >= 0 ? idx : 0;
+                          else delete n[row];
+                          return n;
+                        })
+                      }
+                      className="absolute bottom-1.5 right-1.5 rounded-full bg-black/55 px-2 py-px t-10 text-white transition-opacity hover:bg-black/75"
+                      title={frozen[row] !== undefined ? "恢复轮播" : "定格在这一版"}
+                    >
+                      {frozen[row] !== undefined ? "▶ 轮播" : "⏸ 定格"}
+                    </button>
                   </div>
-                ) : (
-                  <div
-                    className="grid place-items-center rounded-[10px] bg-[var(--bg-1)] t-11 text-[var(--fg-4)] shadow-[inset_0_0_0_0.5px_var(--line-1)]"
-                    style={{ aspectRatio: "9 / 16" }}
-                  >
-                    {shot ? "未生成" : "—"}
+                  <div className="mt-1 truncate t-11 text-[var(--fg-3)]">
+                    {shot ? shot.title : "这一镜没有产出"}
                   </div>
-                )}
-                <div className="mt-1 truncate t-11 text-[var(--fg-3)]">
-                  {shot ? shot.title : "这一版没有这一镜"}
                 </div>
-              </div>
+              </Fragment>
             );
-          })}
-        </Fragment>
-      ))}
+          }
+          return (
+            <Fragment key={row}>
+              <div className="pt-2 t-11 tabular text-[var(--fg-4)]">{pad(row + 1)}</div>
+              {runs.map((r) => {
+                const shot = r.plan!.shots[row];
+                const frame = shotFrame(r, row + 1);
+                const video = shotVideo(r, row + 1);
+                const open = video || frame;
+                const list = r.plan!.shots
+                  .map((_, i) => shotVideo(r, i + 1) || shotFrame(r, i + 1))
+                  .filter(Boolean) as Asset[];
+                return (
+                  <div key={`${r.id}-${row}`} className="min-w-0">
+                    {open ? (
+                      <div
+                        onClick={() => onZoom(open, list)}
+                        className="group relative cursor-zoom-in overflow-hidden rounded-[10px] bg-[var(--bg-base)] shadow-[inset_0_0_0_0.5px_var(--line-1)]"
+                        style={{ aspectRatio: "9 / 16" }}
+                      >
+                        {video ? (
+                          <div className="grid size-full place-items-center text-[var(--fg-3)]">
+                            {I.play(16)}
+                          </div>
+                        ) : (
+                          <img
+                            src={mediaSrc(frame)}
+                            alt={shot?.title || ""}
+                            loading="lazy"
+                            className="size-full object-cover transition-transform duration-500 ease-out group-hover:scale-[1.02]"
+                          />
+                        )}
+                      </div>
+                    ) : (
+                      <div
+                        className="grid place-items-center rounded-[10px] bg-[var(--bg-1)] t-11 text-[var(--fg-4)] shadow-[inset_0_0_0_0.5px_var(--line-1)]"
+                        style={{ aspectRatio: "9 / 16" }}
+                      >
+                        {shot ? "未生成" : "—"}
+                      </div>
+                    )}
+                    <div className="mt-1 truncate t-11 text-[var(--fg-3)]">
+                      {shot ? shot.title : "这一版没有这一镜"}
+                    </div>
+                  </div>
+                );
+              })}
+            </Fragment>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -829,6 +964,7 @@ export function Workspace({ chatOpen, onOpenChat }: { chatOpen: boolean; onOpenC
     assembleShots,
     exportRunAssets,
     exportStoryboard,
+    cleanupTestOutputs,
     deleteRun,
     openOutputDir,
     send,
@@ -1155,6 +1291,14 @@ export function Workspace({ chatOpen, onOpenChat }: { chatOpen: boolean; onOpenC
                         <span className="tabular ml-1.5 text-[var(--fg-4)]">{n}</span>
                       </button>
                     ))}
+                    <div className="flex-1" />
+                    <button
+                      onClick={() => void cleanupTestOutputs()}
+                      className="t-11 text-[var(--fg-4)] transition-colors hover:text-[var(--fg-1)]"
+                      title="把 output/ 里没被任何执行记录引用的冒烟测试产物（demo_/test_ 等）移进 _trash，不真删"
+                    >
+                      清理测试产物
+                    </button>
                   </div>
 
                   <div className="grid gap-3 [grid-template-columns:repeat(auto-fill,minmax(146px,1fr))]">

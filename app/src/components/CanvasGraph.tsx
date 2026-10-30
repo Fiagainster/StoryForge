@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { NODE_INDEX, NODES } from "../lib/nodeSearch";
 import { applyGraphOps } from "../lib/graphOps";
 import { diffSummary, touchedIds } from "../lib/graphAudit";
+import { useStore } from "../lib/store";
 import type { CanvasDoc, NodeRun } from "../lib/store";
 import type { ComfyGraph } from "../types";
 import { Btn, I, Spinner, Tag, cx } from "./ui";
@@ -416,16 +417,11 @@ export function CanvasGraph({
   /** AI 刚动过的节点：高亮 7 秒，让人看见它动了哪儿 */
   const [flashIds, setFlashIds] = useState<Set<string>>(new Set());
   const [showChange, setShowChange] = useState(false);
-  /** 手动点开「＋N 可选」的节点：默认收起，省出来的高度就是可读性 */
-  const [expanded, setExpanded] = useState<Set<string>>(() => {
-    try {
-      const raw = localStorage.getItem("sf.expand");
-      const arr = raw ? JSON.parse(raw) : [];
-      return new Set(Array.isArray(arr) ? (arr as string[]) : []);
-    } catch {
-      return new Set<string>();
-    }
-  });
+  /** 手动点开「＋N 可选」的节点：默认收起，省出来的高度就是可读性。
+   *  状态随工程走（存 project.json，换机器/换工程都还在），不再只存本机 */
+  const expandedIds = useStore((s) => s.expandedIds);
+  const setExpandedIds = useStore((s) => s.setExpandedIds);
+  const expanded = useMemo(() => new Set(expandedIds), [expandedIds]);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const lastRunId = useRef<string>("");
@@ -445,19 +441,13 @@ export function CanvasGraph({
   const hOf = (id: string) => nodeHeight(graph, id, expanded);
   const outAt = (id: string, p: Pos, j: number) => outAnchor(graph, id, p, j, expanded);
   const layout = useMemo(() => computeLayout(graph, expanded), [graph, expanded]);
-  /** 展开/收起可选输入：纯视图状态，不动图，也不进撤销；记在本机，刷新后还是你摊开的那几个 */
-  const toggleExpand = (id: string) =>
-    setExpanded((s) => {
-      const n = new Set(s);
-      if (n.has(id)) n.delete(id);
-      else n.add(id);
-      try {
-        localStorage.setItem("sf.expand", JSON.stringify([...n]));
-      } catch {
-        /* 存不下就算了，不影响用 */
-      }
-      return n;
-    });
+  /** 展开/收起可选输入：纯视图状态，不动图，也不进撤销；随工程持久化，刷新后还是你摊开的那几个 */
+  const toggleExpand = (id: string) => {
+    const n = new Set(expanded);
+    if (n.has(id)) n.delete(id);
+    else n.add(id);
+    setExpandedIds([...n]);
+  };
   const opsCtx = useMemo(
     () => ({
       cardOf: (ct: string) => {
