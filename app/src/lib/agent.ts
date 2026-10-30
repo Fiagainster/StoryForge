@@ -113,6 +113,7 @@ ${NODES.map((n) => `${n.n} — ${n.d} · ${n.c}`).join("\n")}\n`
 - 同一场景连续镜头的 location 逐字一致，方便画面衔接。
 - 不要输出 ComfyUI 节点、class_type、连线；只输出计划。
 - 计划会被编译成一张图放到画布上。所以 reply 里不要让人"确认参数"，只说明你把什么放到画布上了。
+- 用户想在现有分镜**后面加镜头**（"加一个镜头""再来一场""补一镜"，且画布上已有分镜）时：在 plan 同级加 "append": true，plan 的 shots 只写**新增**的镜头，已有镜头绝对不要重复写；已有角色逐字复用锚点，新角色才写进 characters。改已有镜头的参数用 ops，不要用 append。
 ${videoRule}
 ${last}${lessons}${coEdit}`;
 }
@@ -835,6 +836,8 @@ export interface AgentResult {
   needsConfirm?: boolean;
   /** 智能体通过 ops 协议改了现有图，改动进画布等人审查 */
   graphEdited?: boolean;
+  /** 计划是"往后追加新镜"而不是整版重铺：store 编译时从现有最大镜号+1 接着编 */
+  append?: boolean;
   /** 本轮对话模型用量（token） */
   usage?: RunUsage | null;
   /** 本轮实际发给模型的系统提示词，用于人工审查 */
@@ -1208,8 +1211,18 @@ export async function runAgentTurn(
       .slice(0, 6)
       .join("；")}${applied.length > 6 ? "…" : ""}${fixedNote}\n\n改动已放到画布上，看完点「开始生成」。`;
 
+    // 结构能跑 ≠ 语义没错：把新冒出来的警告（比如把 URL 填进了普通字段）捎给用户看
+    const warnBaseline = new Set(
+      auditGraph(opts.lastGraph)
+        .filter((i: AuditIssue) => i.level === "warn")
+        .map((i) => i.text)
+    );
+    const freshWarns = auditGraph(finalGraph)
+      .filter((i: AuditIssue) => i.level === "warn" && !warnBaseline.has(i.text))
+      .slice(0, 2);
+
     return done({
-      reply,
+      reply: freshWarns.length ? `${reply}\n\n提醒：${freshWarns.map((w) => w.text).join("；")}` : reply,
       graph: finalGraph,
       graphEdited: true,
       degraded,
@@ -1268,6 +1281,7 @@ export async function runAgentTurn(
       return done({
         reply: `${reply}\n\n图已经搭到画布上了，看一眼；觉得对就点画布上的「开始生成」。`,
         plan: finalPlan,
+        append: parsed.append === true,
         degraded,
         needsConfirm: true,
         usage: { llmTokens, images: 0, videoSeconds: 0 },

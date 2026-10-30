@@ -8,7 +8,8 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "nodes": "node scripts/build-node-library.mjs"
+    "nodes": "node scripts/build-node-library.mjs",
+    "test": "tsc -p tsconfig.test.json && node scripts/sync-test-json.mjs && node --import ./scripts/register-raw.mjs --test \"./.test-build/**/*.test.js\""
   },
   "dependencies": {
     "@tauri-apps/api": "^2.9.0",

@@ -27,7 +27,7 @@ const joinPath = (dir: string, ...parts: (string | undefined)[]) => {
     .filter(Boolean);
   return [dir.replace(/[\\/]+$/, ""), ...tail].join(sep);
 };
-import { compilePlan } from "./plan";
+import { compilePlan, maxShotOf, storyboardCsv } from "./plan";
 import { auditGraph, blockingIssues, diffGraph } from "./graphAudit";
 import type { GraphDiff } from "./graphAudit";
 import type { WatchEvent } from "./comfy";
@@ -167,9 +167,13 @@ interface Store {
   setProjectsRoot: (path: string) => Promise<void>;
   /** 导出一条记录的成片（没有成片就导出分镜视频）到项目的 export/ 文件夹 */
   exportRunAssets: (runId: string) => Promise<void>;
+  /** 把这一版的分镜表（镜号/景别/运镜/台词/时长）导出成 CSV，进项目 export/ */
+  exportStoryboard: (runId: string) => Promise<void>;
   /** 自我完善：把一条经验沉淀进配置，之后出计划都会带上 */
   addLearning: (lesson: string) => Promise<void>;
   clearLearnings: () => Promise<void>;
+  /** 删除单条经验（设置页手动编辑） */
+  removeLearning: (index: number) => Promise<void>;
   /** 内部：执行结果统一落一条助手消息（不暴露给组件） */
   runAndAnnounce: (
     promise: Promise<{ reply: string; run?: RunRecord; graph?: ComfyGraph; error?: string }>,
@@ -877,21 +881,92 @@ export const useStore = create<Store>((set, get) => {
         let nextDraft = s.draft;
         let publishError: string | null = null;
         if (result.plan) {
-          const compiled = compilePlan(result.plan, {
-            imageModel: config?.image?.model ?? "",
-            imageSize: config?.image?.size ?? "1080x1920",
-            videoModel: config?.video?.model ?? "",
-            videoResolution: config?.video?.resolution ?? "720p",
-            generateAudio: config?.video?.generateAudio !== false,
-            withVideo: !!config?.ark?.apiKey && result.plan.mode === "video",
-            continuity: true,
-          });
+          // 增量追加：用户说"加一镜"，只把新镜并进现有画布，不整版重铺。
+          // 前提：画布上确实有一版分镜（有 plan、有 shot_N_ 节点）。
+          const basePlan = result.append ? s.draft.plan : null;
+          const appending = !!basePlan && maxShotOf(s.draft.graph) > 0;
+          const prevGraph = s.draft.graph;
+          let compiled: ComfyGraph;
+
+          if (appending) {
+            const m = maxShotOf(prevGraph);
+            const merged: ComfyGraph = { ...prevGraph };
+            // 旧末镜还没有尾帧节点就补一个，新第一镜的衔接参考才有处接
+            let prevTail: string | undefined;
+            if (!!config?.ark?.apiKey && result.plan.mode === "video" && merged[`shot_${m}_video`]) {
+              prevTail = `shot_${m}_tail`;
+              if (!merged[prevTail]) {
+                merged[prevTail] = {
+                  class_type: "DramaContinuity",
+                  inputs: { video: [`shot_${m}_video`, 0] },
+                  _meta: { title: `镜头 ${m} 尾帧` },
+                };
+              }
+            }
+            // 同名角色复用旧图里的定妆节点，不重复生成
+            const reuseChars = new Map<string, string>();
+            for (const [id, node] of Object.entries(prevGraph)) {
+              if (/^char_/.test(id)) {
+                const name = String((node.inputs as Record<string, unknown>)?.name ?? "");
+                if (name) reuseChars.set(name, id);
+              }
+            }
+            compiled = {
+              ...merged,
+              ...compilePlan(result.plan, {
+                imageModel: config?.image?.model ?? "",
+                imageSize: config?.image?.size ?? "1080x1920",
+                videoModel: config?.video?.model ?? "",
+                videoResolution: config?.video?.resolution ?? "720p",
+                generateAudio: config?.video?.generateAudio !== false,
+                withVideo: !!config?.ark?.apiKey && result.plan.mode === "video",
+                continuity: true,
+                startShot: m + 1,
+                prevTail,
+                reuseChars,
+              }),
+            };
+          } else {
+            compiled = compilePlan(result.plan, {
+              imageModel: config?.image?.model ?? "",
+              imageSize: config?.image?.size ?? "1080x1920",
+              videoModel: config?.video?.model ?? "",
+              videoResolution: config?.video?.resolution ?? "720p",
+              generateAudio: config?.video?.generateAudio !== false,
+              withVideo: !!config?.ark?.apiKey && result.plan.mode === "video",
+              continuity: true,
+            });
+          }
           // 编译出来的图必须先证明自己能跑，才允许放到画布上
           const checked = validateAndRepair(compiled);
           const blocking = blockingIssues(auditGraph(checked.graph));
           if (blocking.length) {
             publishError = `这版分镜编译出来的图跑不起来：${blocking[0].text}。画布没动。`;
             get().addLog("error", publishError);
+          } else if (appending) {
+            // 合并后的计划 = 旧镜 + 新镜：镜号才能和 shot_N_ 节点对得上
+            const baseNames = new Set(basePlan!.characters.map((c) => c.name));
+            const mergedPlan: DramaPlan = {
+              ...basePlan!,
+              characters: [
+                ...basePlan!.characters,
+                ...result.plan.characters.filter((c) => !baseNames.has(c.name)),
+              ],
+              shots: [...basePlan!.shots, ...result.plan.shots],
+            };
+            nextDraft = {
+              id: uid(),
+              graph: checked.graph,
+              plan: mergedPlan,
+              title: `${basePlan!.title} +${result.plan.shots.length} 镜`,
+              status: "draft",
+              note: result.reply.split("\n")[0],
+              fromAI: true,
+              change: diffGraph(prevGraph, checked.graph),
+              rebuild: undefined,
+              changedAt: Date.now(),
+              ts: Date.now(),
+            };
           } else {
             // 重新编译分镜时节点 id 会撞上旧图：这其实是"整版重铺"，
             // 不能只按 id 差出"改了 3 处"，那看着像没干活
@@ -1212,6 +1287,15 @@ export const useStore = create<Store>((set, get) => {
   clearLearnings: async () => {
     await get().saveConfig({ memory: { learnings: [] } } as any);
     get().addLog("info", "经验记忆已清空");
+  },
+
+  removeLearning: async (index) => {
+    const { config } = get();
+    const cur = config?.memory?.learnings ?? [];
+    if (index < 0 || index >= cur.length) return;
+    const next = cur.filter((_, i) => i !== index);
+    await get().saveConfig({ memory: { learnings: next } } as any);
+    get().addLog("info", `已删除经验：${cur[index].slice(0, 40)}`);
   },
 
   assembleShots: async (runId) => {
@@ -1815,7 +1899,27 @@ export const useStore = create<Store>((set, get) => {
     } catch (e) {
       get().addLog("error", `导出失败：${e}`);
     }
-  },  };
+  },
+
+  exportStoryboard: async (runId) => {
+    const s = get();
+    if (s.busy) return;
+    const run = s.runs.find((r) => r.id === runId);
+    if (!run?.plan) return;
+    if (!s.project) {
+      set({ error: "还没打开项目，分镜表没有地方落" });
+      return;
+    }
+    try {
+      const csv = storyboardCsv(run.plan, run.editOrder);
+      const safe = run.plan.title.replace(/[\\/:*?"<>|]/g, "_").slice(0, 40) || run.id;
+      const path = await api.projectWriteExport(s.project.id, `分镜表-${safe}.csv`, csv);
+      get().addLog("info", `分镜表已导出到项目 export/：${path}`);
+    } catch (e) {
+      get().addLog("error", `分镜表导出失败：${e}`);
+    }
+  },
+  };
 });
 
 // 会话镜像与持久化：messages/runs 变化写回当前会话，并存 localStorage

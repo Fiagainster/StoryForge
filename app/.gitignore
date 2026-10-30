@@ -17,3 +17,4 @@ engine/workspace/custom_nodes/**/__pycache__/
 engine/workspace/custom_nodes/storyforge_ark/ark_key.txt
 engine/ComfyUI/__pycache__/
 engine/ComfyUI/**/__pycache__/
+.test-build/

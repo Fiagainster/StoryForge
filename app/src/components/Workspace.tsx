@@ -351,6 +351,7 @@ function PlanRun({
   onMove,
   onResetOrder,
   onExport,
+  onStoryboard,
 }: {
   run: RunRecord;
   onZoom: (a: Asset, list: Asset[]) => void;
@@ -362,6 +363,7 @@ function PlanRun({
   onMove: (from: number, to: number) => void;
   onResetOrder: () => void;
   onExport: (runId: string) => void;
+  onStoryboard: (runId: string) => void;
 }) {
   const plan = run.plan!;
   const seconds = plan.shots.reduce((sum, s) => sum + s.duration, 0);
@@ -458,6 +460,16 @@ function PlanRun({
             title={film ? "把成片拷进项目的 export/ 文件夹" : "把分镜视频拷进项目的 export/ 文件夹"}
           >
             导出
+          </Btn>
+          <Btn
+            size="xs"
+            variant="outline"
+            icon={I.logs(11)}
+            onClick={() => onStoryboard(run.id)}
+            disabled={busy}
+            title="把分镜表（镜号/景别/运镜/台词/时长）导出成 CSV，进项目 export/，给剪辑软件用"
+          >
+            分镜表
           </Btn>
           <IconBtn label="打开输出目录" onClick={onOpenDir}>
             {I.folder(13)}
@@ -816,6 +828,7 @@ export function Workspace({ chatOpen, onOpenChat }: { chatOpen: boolean; onOpenC
     resetDraft,
     assembleShots,
     exportRunAssets,
+    exportStoryboard,
     deleteRun,
     openOutputDir,
     send,
@@ -907,6 +920,7 @@ export function Workspace({ chatOpen, onOpenChat }: { chatOpen: boolean; onOpenC
             busy={busy}
             onAssemble={(id) => void assembleShots(id)}
             onExport={(id) => void exportRunAssets(id)}
+            onStoryboard={(id) => void exportStoryboard(id)}
             onDelete={deleteRun}
             onOpenDir={() => void openOutputDir()}
             onMove={(from, to) => moveShot(run.id, from, to)}

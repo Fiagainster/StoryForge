@@ -129,3 +129,7 @@ export const projectDelete = (id: string) => invoke<void>("project_delete", { id
 
 export const projectExportFiles = (id: string, paths: string[]) =>
   invoke<string[]>("project_export_files", { id, paths });
+
+/** 把一段文本（分镜表 CSV 等）写进项目的 export/ 文件夹，返回落点绝对路径 */
+export const projectWriteExport = (id: string, filename: string, contents: string) =>
+  invoke<string>("project_write_export", { id, filename, contents });

@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": false,
+    "outDir": ".test-build",
+    "rootDir": "src",
+    "resolveJsonModule": true,
+    "types": []
+  },
+  "include": [
+    "src/node-test.d.ts",
+    "src/vite-env.d.ts",
+    "src/lib/plan.ts",
+    "src/lib/graphOps.ts",
+    "src/lib/graphAudit.ts",
+    "src/lib/nodeSearch.ts",
+    "src/lib/shot-merge.ts",
+    "src/lib/plan.test.ts",
+    "src/lib/graphOps.test.ts",
+    "src/lib/graphAudit.test.ts"
+  ]
+}

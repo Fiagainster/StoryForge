@@ -140,9 +140,28 @@ export interface CompileOptions {
   withVideo: boolean;
   /** 多镜时把上一镜尾帧接给下一镜首帧当衔接参考（仅视频模式） */
   continuity?: boolean;
+  /**
+   * 增量追加：新镜头从第几号开始编（默认 1）。
+   * 编号必须和画布上已有的 shot_N_ 节点错开，追加分镜时传 maxShotOf(旧图)+1。
+   */
+  startShot?: number;
+  /** 增量追加：新第一镜的 previous_frame 接到旧图这个节点上（旧末镜的尾帧） */
+  prevTail?: string;
+  /** 增量追加：按角色名复用旧图里已有的定妆节点（name → nodeId），不再重复生成 */
+  reuseChars?: Map<string, string>;
 }
 
 const pad = (n: number) => String(n).padStart(2, "0");
+
+/** 图里最大的分镜编号：增量追加时决定新镜从几号开始 */
+export function maxShotOf(graph: ComfyGraph): number {
+  let max = 0;
+  for (const id of Object.keys(graph || {})) {
+    const m = /^shot_(\d+)_/.exec(id);
+    if (m) max = Math.max(max, Number(m[1]));
+  }
+  return max;
+}
 
 /**
  * 计划 → ComfyUI API 图。连线由编译器保证，不交给模型即兴发挥。
@@ -151,10 +170,18 @@ export function compilePlan(plan: DramaPlan, opts: CompileOptions): ComfyGraph {
   const graph: ComfyGraph = {};
   const used = new Set(plan.shots.flatMap((s) => s.characters));
   const charNodes = new Map<string, string>();
+  const start = opts.startShot ?? 1;
 
   for (const c of plan.characters) {
     if (!used.has(c.id)) continue;
-    const nodeId = `char_${c.id}`;
+    // 追加模式：同名角色直接复用旧图里的定妆节点，不重复生成
+    const reused = opts.reuseChars?.get(c.name);
+    if (reused) {
+      charNodes.set(c.id, reused);
+      continue;
+    }
+    // 追加模式下新角色的 id 可能撞上旧图（旧图也有 char_c1），加个后缀错开
+    const nodeId = opts.reuseChars ? `char_${c.id}_n${start}` : `char_${c.id}`;
     graph[nodeId] = {
       class_type: "DramaCharacter",
       inputs: {
@@ -172,7 +199,7 @@ export function compilePlan(plan: DramaPlan, opts: CompileOptions): ComfyGraph {
   }
 
   plan.shots.forEach((shot, index) => {
-    const n = index + 1;
+    const n = start + index;
     const frameId = `shot_${n}_frame`;
     const castAnchor = shot.characters
       .map((id) => {
@@ -198,9 +225,14 @@ export function compilePlan(plan: DramaPlan, opts: CompileOptions): ComfyGraph {
       const node = charNodes.get(id);
       if (node) inputs[`character${i + 1}`] = [node, 0];
     });
-    // 尾帧接续：上一镜视频的最后一帧作为本镜画面的衔接参考
-    if (opts.withVideo && opts.continuity !== false && index > 0) {
-      inputs.previous_frame = [`shot_${index}_tail`, 0];
+    // 尾帧接续：上一镜视频的最后一帧作为本镜画面的衔接参考。
+    // 追加模式第一镜接旧图传进来的尾帧节点；多镜内部照旧接前一镜。
+    if (opts.withVideo && opts.continuity !== false) {
+      if (index === 0 && opts.prevTail) {
+        inputs.previous_frame = [opts.prevTail, 0];
+      } else if (index > 0) {
+        inputs.previous_frame = [`shot_${n - 1}_tail`, 0];
+      }
     }
 
     graph[frameId] = {
@@ -281,6 +313,54 @@ export function planStats(plan: DramaPlan) {
     characters: plan.characters.length,
     seconds: plan.shots.reduce((sum, s) => sum + s.duration, 0),
   };
+}
+
+/**
+ * 分镜表 CSV：一行一镜，按出片顺序排。
+ * 给剪辑软件当台词/分镜清单用——工具不碰剪辑，但要把台词交得出去。
+ * 带 UTF-8 BOM，Excel 直接双击打开中文不乱码。
+ */
+export function storyboardCsv(plan: DramaPlan, order?: number[]): string {
+  const esc = (v: string | number) => {
+    const s = String(v);
+    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const seq =
+    order && order.length === plan.shots.length ? order : plan.shots.map((_, i) => i);
+  const head = [
+    "出片顺序",
+    "镜号",
+    "镜头名",
+    "景别",
+    "运镜",
+    "场景",
+    "动作",
+    "情绪",
+    "台词",
+    "时长(秒)",
+    "角色",
+  ];
+  const rows = seq.map((orig, pos) => {
+    const s = plan.shots[orig];
+    const names = s.characters
+      .map((id) => plan.characters.find((c) => c.id === id)?.name)
+      .filter(Boolean)
+      .join("、");
+    return [
+      pos + 1,
+      orig + 1,
+      s.title,
+      s.shotSize,
+      s.camera,
+      s.location,
+      s.action,
+      s.emotion ?? "",
+      s.dialogue ?? "",
+      s.duration,
+      names,
+    ];
+  });
+  return "\uFEFF" + [head, ...rows].map((r) => r.map(esc).join(",")).join("\r\n");
 }
 
 /* ------------------------------------------------------------------ *

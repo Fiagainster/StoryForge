@@ -133,11 +133,24 @@ function visibleTitle(graph: ComfyGraph, id: string): string {
     : `${id}(${graph[id]?.class_type || "?"})`;
 }
 
+/** 节点卡查询：默认走节点库；测试时注入假卡，纯函数可离线跑 */
+export interface AuditLookup {
+  cardOf?: (classType: string) =>
+    | { d?: string; in: LibInput[] }
+    | undefined;
+  blockedOf?: (classType: string) => { why: string[] } | undefined;
+}
+
+const httpish = (v: unknown): v is string =>
+  typeof v === "string" && /^https?:\/\/\S+$/i.test(v.trim());
+
 /**
  * 审计一张图能不能跑。
  * 只报"跑不起来"和"跑了也白跑"，不报风格问题——风格是人的事。
  */
-export function auditGraph(graph: ComfyGraph): AuditIssue[] {
+export function auditGraph(graph: ComfyGraph, lookup?: AuditLookup): AuditIssue[] {
+  const cardOf = lookup?.cardOf ?? ((ct: string) => NODE_INDEX.get(ct));
+  const blockedOf = lookup?.blockedOf ?? ((ct: string) => BLOCKED_INDEX.get(ct));
   const issues: AuditIssue[] = [];
   const ids = Object.keys(graph || {});
   if (!ids.length) return [{ level: "error", text: "画布是空的，没有可执行的节点" }];
@@ -146,9 +159,9 @@ export function auditGraph(graph: ComfyGraph): AuditIssue[] {
 
   for (const id of ids) {
     const node = graph[id];
-    const card = NODE_INDEX.get(node.class_type);
+    const card = cardOf(node.class_type);
     if (!card) {
-      const blocked = BLOCKED_INDEX.get(node.class_type);
+      const blocked = blockedOf(node.class_type);
       issues.push({
         level: "error",
         id,
@@ -190,6 +203,16 @@ export function auditGraph(graph: ComfyGraph): AuditIssue[] {
           level: "warn",
           id,
           text: `${visibleTitle(graph, id)} 的 "${key}" 是 ${spec.t}，接了一根线，ComfyUI 会忽略这个值`,
+        });
+        continue;
+      }
+      // 语义启发式：普通 STRING 字段里填了个 URL，多半是把该连线的东西写成了文件名/地址。
+      // 静态结构查不出语义错，但这类"字段里躺着 URL"的错配抓得出来。
+      if (spec.t === "STRING" && httpish(v) && !/url|link|endpoint/i.test(key)) {
+        issues.push({
+          level: "warn",
+          id,
+          text: `${visibleTitle(graph, id)} 的 "${key}" 里填的是一个网址（${String(v).slice(0, 60)}…）——多半应该用连线把上游接过来，而不是把 URL 写进这个字段`,
         });
       }
     }

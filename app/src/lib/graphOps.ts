@@ -94,8 +94,9 @@ export function applyGraphOps(
         if (op.inputs && typeof op.inputs === "object" && !Array.isArray(op.inputs)) {
           for (const [k, v] of Object.entries(op.inputs)) {
             if (Array.isArray(v)) {
+              // 整条拒绝：带连线的 add 落一半在画布上比不加更糟
               errors.push(`${tag}: inputs.${k} 是连线，请用 connect 操作`);
-              continue;
+              return;
             }
             inputs[k] = v;
           }

@@ -528,9 +528,24 @@ fn project_save(app: tauri::AppHandle, id: String, json: String) -> Result<(), S
     }
     let dir = projects_root(&app)?.join(&id);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // 备份轮换：project.json.bak1/2/3。整包覆盖写是唯一副本，
+    // 万一哪次把空骨架/坏数据盖上去，还有最近 3 版可以捞回来。
+    // 轮换失败（被占用等）只跳过备份，不影响本次保存。
+    let rotate = |from: &std::path::Path, to: &std::path::Path| {
+        if !from.exists() {
+            return;
+        }
+        if to.exists() {
+            let _ = std::fs::remove_file(to);
+        }
+        let _ = std::fs::rename(from, to);
+    };
+    let meta_path = dir.join("project.json");
+    rotate(&dir.join("project.json.bak2"), &dir.join("project.json.bak3"));
+    rotate(&dir.join("project.json.bak1"), &dir.join("project.json.bak2"));
+    rotate(&meta_path, &dir.join("project.json.bak1"));
     // 先写临时文件再改名，写一半断电也不至于把项目弄坏
     let tmp = dir.join("project.json.tmp");
-    let meta_path = dir.join("project.json");
     std::fs::write(&tmp, json.as_bytes()).map_err(|e| format!("写入项目失败: {e}"))?;
     std::fs::rename(&tmp, &meta_path).map_err(|e| format!("保存项目失败: {e}"))
 }
@@ -643,6 +658,46 @@ fn project_export_files(app: tauri::AppHandle, id: String, paths: Vec<String>) -
         out.push(dest.to_string_lossy().to_string());
     }
     Ok(out)
+}
+
+/// 把一段文本（分镜表 CSV 等）写进项目的 export/ 文件夹，返回落点绝对路径。
+/// 重名自动带序号，不覆盖已导出的东西。
+#[tauri::command]
+fn project_write_export(
+    app: tauri::AppHandle,
+    id: String,
+    filename: String,
+    contents: String,
+) -> Result<String, String> {
+    if id.contains('\\') || id.contains('/') || id.contains("..") {
+        return Err("非法项目 id".into());
+    }
+    let name = sanitize_dir_name(&filename);
+    if name.is_empty() {
+        return Err("文件名不能为空".into());
+    }
+    let dir = projects_root(&app)?.join(&id);
+    if !dir.join("project.json").is_file() {
+        return Err("项目不存在".into());
+    }
+    let export_dir = dir.join("export");
+    std::fs::create_dir_all(&export_dir).map_err(|e| format!("创建 export 目录失败: {e}"))?;
+    let mut dest = export_dir.join(&name);
+    let mut n = 2;
+    while dest.exists() {
+        let stem = std::path::Path::new(&name)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "export".into());
+        let ext = std::path::Path::new(&name)
+            .extension()
+            .map(|e| format!(".{}", e.to_string_lossy()))
+            .unwrap_or_default();
+        dest = export_dir.join(format!("{stem}_{n}{ext}"));
+        n += 1;
+    }
+    std::fs::write(&dest, contents.as_bytes()).map_err(|e| format!("写入失败：{e}"))?;
+    Ok(dest.to_string_lossy().to_string())
 }
 
 fn chrono_millis() -> u64 {
@@ -1000,7 +1055,8 @@ pub fn run() {
             project_create,
             project_rename,
             project_delete,
-            project_export_files
+            project_export_files,
+            project_write_export
         ])
         .run(tauri::generate_context!())
         .expect("StoryForge 启动失败");

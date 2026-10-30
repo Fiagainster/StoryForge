@@ -6,7 +6,7 @@ import { LIB_STATS, LIB_VERSION, MISSING_CORE, REFERENCE_NODES } from "../lib/no
 import { Btn, I, IconBtn, Spinner, Tag } from "./ui";
 
 export function SettingsDialog({ onClose }: { onClose: () => void }) {
-  const { config, env, saveConfig, clearLearnings, idleStopMin, setIdleStopMin, setProjectsRoot } =
+  const { config, env, saveConfig, clearLearnings, addLearning, removeLearning, idleStopMin, setIdleStopMin, setProjectsRoot } =
     useStore();
   const [baseUrl, setBaseUrl] = useState("");
   const [apiKey, setApiKey] = useState("");
@@ -80,6 +80,14 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
   };
 
   const learnings = config?.memory?.learnings ?? [];
+
+  /* 经验记忆手动编辑：单条删除 + 手动添加 */
+  const [newLesson, setNewLesson] = useState("");
+  const addLesson = async () => {
+    if (!newLesson.trim()) return;
+    await addLearning(newLesson);
+    setNewLesson("");
+  };
 
   /* 项目根目录：独立保存（换根会把当前项目先落盘到旧位置） */
   const [projRoot, setProjRoot] = useState("");
@@ -325,29 +333,50 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
             </p>
           </Section>
 
-          <Section title="经验记忆" hint="失败修复时自动提炼">
+          <Section title="经验记忆" hint="失败修复时自动提炼，也可手动编辑">
             <p className="t-11 leading-[17px] text-[var(--fg-4)]">
               执行失败自动修复时提炼一句经验，之后每次出计划都会带上，越用越贴合你的机器与口味。
             </p>
             {learnings.length ? (
-              <>
-                <div className="max-h-[148px] space-y-1.5 overflow-y-auto">
-                  {learnings.map((l, i) => (
-                    <div
-                      key={i}
-                      className="border-l-[1.5px] border-[var(--line-3)] pl-2.5 t-12 leading-[18px] text-[var(--fg-2)]"
+              <div className="max-h-[168px] space-y-1.5 overflow-y-auto">
+                {learnings.map((l, i) => (
+                  <div
+                    key={i}
+                    className="group flex items-start gap-1.5 border-l-[1.5px] border-[var(--line-3)] pl-2.5 t-12 leading-[18px] text-[var(--fg-2)]"
+                  >
+                    <span className="min-w-0 flex-1">{l}</span>
+                    <button
+                      className="mt-px shrink-0 text-[var(--fg-4)] opacity-0 transition-opacity hover:text-[var(--err)] group-hover:opacity-100"
+                      title="删除这条经验"
+                      onClick={() => void removeLearning(i)}
                     >
-                      {l}
-                    </div>
-                  ))}
-                </div>
-                <Btn size="sm" variant="ghost" onClick={() => void clearLearnings()}>
-                  清空记忆
-                </Btn>
-              </>
+                      {I.close(11)}
+                    </button>
+                  </div>
+                ))}
+              </div>
             ) : (
               <div className="t-12 text-[var(--fg-4)]">还没有沉淀任何经验。</div>
             )}
+            <div className="flex items-center gap-2">
+              <input
+                className="min-w-0 flex-1 rounded-[7px] border border-[var(--line-2)] bg-[var(--bg-2)] px-2.5 py-1.5 t-12 text-[var(--fg-1)] outline-none placeholder:text-[var(--fg-4)] focus:border-[var(--line-3)]"
+                placeholder="手动加一条经验，比如「 Seedance 不接受真人脸」"
+                value={newLesson}
+                onChange={(e) => setNewLesson(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void addLesson();
+                }}
+              />
+              <Btn size="sm" variant="outline" onClick={() => void addLesson()} disabled={!newLesson.trim()}>
+                添加
+              </Btn>
+            </div>
+            {learnings.length ? (
+              <Btn size="sm" variant="ghost" onClick={() => void clearLearnings()}>
+                清空记忆
+              </Btn>
+            ) : null}
           </Section>
 
           <Section title="节点库" hint={`ComfyUI ${LIB_VERSION}`}>
