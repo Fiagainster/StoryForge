@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
 #[cfg(windows)]
@@ -131,6 +131,9 @@ struct VideoVal {
     duration: Option<f64>,
     /// 这条视频是哪家供应商生成的（P1-2 成本对账按家记账；本地素材 = "local"）
     provider: String,
+    /// 实际请求的计划时长（秒）。即梦会吸附到 5/10 档，与节点参数可能不同——
+    /// 自审比对用这个（有值时），否则回落节点参数。
+    planned: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -314,9 +317,9 @@ async fn ark_post(ctx: &RunCtx, path: &str, body: &Value, timeout: u64) -> Resul
     let status = resp.status().as_u16();
     let text = resp.text().await.unwrap_or_default();
     if status >= 400 {
-        return Err(format!("ARK 调用失败 HTTP {status}: {}", &text[..text.len().min(800)]));
+        return Err(format!("ARK 调用失败 HTTP {status}: {}", truncate(&text, 400)));
     }
-    serde_json::from_str(&text).map_err(|e| format!("ARK 响应解析失败：{e}｜{}", &text[..text.len().min(300)]))
+    serde_json::from_str(&text).map_err(|e| format!("ARK 响应解析失败：{e}｜{}", truncate(&text, 150)))
 }
 
 async fn ark_get(ctx: &RunCtx, path: &str) -> Result<Value, String> {
@@ -331,7 +334,7 @@ async fn ark_get(ctx: &RunCtx, path: &str) -> Result<Value, String> {
     let status = resp.status().as_u16();
     let text = resp.text().await.unwrap_or_default();
     if status >= 400 {
-        return Err(format!("ARK 查询失败 HTTP {status}: {}", &text[..text.len().min(500)]));
+        return Err(format!("ARK 查询失败 HTTP {status}: {}", truncate(&text, 250)));
     }
     serde_json::from_str(&text).map_err(|e| format!("ARK 响应解析失败：{e}"))
 }
@@ -529,10 +532,28 @@ async fn ark_video(
     let mut video_url = String::new();
     let mut last_status = String::new();
     let started = std::time::Instant::now();
+    // 长轮询网络抖动容忍：连续 3 次查询失败才放弃（任务已在 provider 侧计费，一次抖动弃单 = 钱白花）
+    let mut poll_fails = 0u32;
     while tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_secs(5)).await;
         ctx.check_cancel()?;
-        let info = ark_get(ctx, &format!("/contents/generations/tasks/{task_id}")).await?;
+        let info = match ark_get(ctx, &format!("/contents/generations/tasks/{task_id}")).await {
+            Ok(v) => {
+                poll_fails = 0;
+                v
+            }
+            Err(e) => {
+                poll_fails += 1;
+                if poll_fails >= 3 {
+                    return Err(format!("Seedance 查询连续失败 {poll_fails} 次，放弃等待（task {task_id}）：{e}"));
+                }
+                ctx.emit(json!({
+                    "type": "progress", "node": node,
+                    "detail": format!("查询抖动（{poll_fails}/3），继续等待：{}", truncate(&e, 120)),
+                }));
+                continue;
+            }
+        };
         let status = info.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
         if !status.is_empty() {
             last_status = status.clone();
@@ -563,7 +584,7 @@ async fn ark_video(
     std::fs::create_dir_all(&ctx.tmp_dir).map_err(|e| e.to_string())?;
     let path = ctx.tmp_dir.join(format!("seedance_{}.mp4", new_prompt_id()));
     std::fs::write(&path, &bytes).map_err(|e| format!("落盘视频失败：{e}"))?;
-    Ok(VideoVal { path, duration: None, provider: "ark".into() })
+    Ok(VideoVal { path, duration: None, provider: "ark".into(), planned: None })
 }
 
 trait UrlOpt {
@@ -595,14 +616,47 @@ fn truncate(s: &str, n: usize) -> String {
 // ffmpeg 杂活：占位图 / 缩放 / 抽尾帧 / 探时长
 // ---------------------------------------------------------------------------
 
+/// 带超时的子进程输出收集：stdout/stderr 落临时文件（避免管道写满把子进程卡住），
+/// 轮询退出状态，超时 kill 后返回 None——坏文件/异常输入最多浪费 timeout 秒，不会挂死整个 run。
+fn cmd_output_timeout(cmd: &mut std::process::Command, timeout: Duration) -> Option<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let tmp_out = std::env::temp_dir().join(format!("sf_cmd_{}.out", new_prompt_id()));
+    let tmp_err = std::env::temp_dir().join(format!("sf_cmd_{}.err", new_prompt_id()));
+    let fout = std::fs::File::create(&tmp_out).ok()?;
+    let ferr = std::fs::File::create(&tmp_err).ok()?;
+    cmd.stdin(Stdio::null()).stdout(Stdio::from(fout)).stderr(Stdio::from(ferr));
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let mut child = cmd.spawn().ok()?;
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&tmp_out);
+                let _ = std::fs::remove_file(&tmp_err);
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => return None,
+        }
+    };
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let _ = std::fs::File::open(&tmp_out).map(|mut f| f.read_to_end(&mut stdout));
+    let _ = std::fs::File::open(&tmp_err).map(|mut f| f.read_to_end(&mut stderr));
+    let _ = std::fs::remove_file(&tmp_out);
+    let _ = std::fs::remove_file(&tmp_err);
+    Some(std::process::Output { status, stdout, stderr })
+}
+
 fn run_ffmpeg(bin: &Path, args: &[&str]) -> Result<(), String> {
     let mut cmd = std::process::Command::new(bin);
     cmd.args(args);
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    let out = cmd
-        .output()
-        .map_err(|e| format!("启动 ffmpeg 失败：{e}"))?;
+    let out = cmd_output_timeout(&mut cmd, Duration::from_secs(900)).ok_or("ffmpeg 执行超时（15 分钟），输入可能损坏")?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(format!(
@@ -686,9 +740,7 @@ fn ffprobe_duration(ffprobe: &Path, file: &Path) -> Option<f64> {
         "-of", "default=noprint_wrappers=1:nokey=1",
         file.to_str()?,
     ]);
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    let out = cmd.output().ok()?;
+    let out = cmd_output_timeout(&mut cmd, Duration::from_secs(30))?;
     if !out.status.success() {
         return None;
     }
@@ -800,11 +852,13 @@ struct Audit {
     failed: Vec<String>,
     notes: Vec<String>,
     details: Value,
+    /// 确定性失败（尺寸不符/分辨率不足/音轨缺失——与输入参数绑定，重跑参数不变必然复现）
+    deterministic: bool,
 }
 
 impl Audit {
     fn pass(notes: Vec<String>, details: Value) -> Self {
-        Self { ok: true, failed: Vec::new(), notes, details }
+        Self { ok: true, failed: Vec::new(), notes, details, deterministic: false }
     }
     fn fail(&self) -> String {
         self.failed.join("；")
@@ -823,11 +877,12 @@ impl Audit {
 }
 
 /// 重跑决策（纯函数，可单测）：通过 → 收货；取消 → 收货；
+/// 确定性失败（重跑必复现）→ 直接收货但播报警告，不烧钱重跑；
 /// 超过轮数上限 → 收货但播报警告；否则 → 重跑。
-fn retry_decision(ok: bool, attempt: u32, cancelled: bool) -> u8 {
+fn retry_decision(ok: bool, attempt: u32, cancelled: bool, deterministic: bool) -> u8 {
     if cancelled || ok {
         0 // Accept
-    } else if attempt >= AUDIT_MAX_RETRY {
+    } else if deterministic || attempt >= AUDIT_MAX_RETRY {
         2 // CapWarn
     } else {
         1 // Rerun
@@ -898,9 +953,7 @@ fn frame_luma(ffmpeg: &Path, src: &str, seek: Option<&str>) -> Option<Luma> {
     ]);
     let mut cmd = std::process::Command::new(ffmpeg);
     cmd.args(&args);
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    let out = cmd.output().ok()?;
+    let out = cmd_output_timeout(&mut cmd, Duration::from_secs(30))?;
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stderr),
@@ -917,9 +970,7 @@ fn ffprobe_streams(ffprobe: &Path, file: &Path) -> Option<(Option<u32>, Option<u
         "-of", "json",
         file.to_str()?,
     ]);
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    let out = cmd.output().ok()?;
+    let out = cmd_output_timeout(&mut cmd, Duration::from_secs(30))?;
     if !out.status.success() {
         return None;
     }
@@ -989,7 +1040,9 @@ fn audit_image(ffmpeg: &Path, tmp_dir: &Path, img: &ImageVal, size_param: &str) 
     } else {
         notes.push("无法读取图片尺寸，已跳过尺寸校验".into());
     }
-    Audit { ok: failed.is_empty(), failed, notes, details }
+    // 尺寸不符是参数级失败：重跑参数不变必然复现
+    let deterministic = failed.iter().any(|f| f.contains("尺寸") && f.contains("不符"));
+    Audit { ok: failed.is_empty(), failed, notes, details, deterministic }
 }
 
 /// 视频自审：实测时长 vs 计划（±1.5s）+ 分辨率短边 + 音轨 + 首/中/尾三帧亮度判全黑全白
@@ -1003,8 +1056,9 @@ fn audit_video(
 ) -> Audit {
     let mut failed = Vec::new();
     let mut notes = Vec::new();
+    let mut deterministic = false;
     if !path.exists() {
-        return Audit { ok: false, failed: vec!["视频文件不存在".into()], notes, details: json!({}) };
+        return Audit { ok: false, failed: vec!["视频文件不存在".into()], notes, details: json!({}), deterministic: false };
     }
     let src = path.to_str().unwrap_or("");
     let mut details = json!({ "planned_duration": planned, "generate_audio": generate_audio });
@@ -1040,6 +1094,7 @@ fn audit_video(
             details["has_audio"] = json!(audio);
             if generate_audio && !audio {
                 failed.push("要求生成音频，但没有音轨".into());
+                deterministic = true; // 模型档位不支持音频，重跑必复现
             }
             if audio {
                 notes.push("音轨 ✓".to_string());
@@ -1058,6 +1113,7 @@ fn audit_video(
                             "分辨率 {w}x{h} 达不到 {resolution}（短边 {short:.0} < {}）",
                             (expected_short * RESOLUTION_TOLERANCE) as u32
                         ));
+                        deterministic = true; // 模型档位分辨率固定，重跑必复现
                     } else {
                         notes.push(format!("分辨率 {w}x{h} ✓"));
                     }
@@ -1094,7 +1150,7 @@ fn audit_video(
         }
     }
 
-    Audit { ok: failed.is_empty(), failed, notes, details }
+    Audit { ok: failed.is_empty(), failed, notes, details, deterministic }
 }
 
 /// 对一个生成节点的产物做自审（按节点类型分发）
@@ -1116,11 +1172,15 @@ fn audit_node_outputs(
             Audit::pass(vec!["没有图片产物，跳过质检".into()], json!({}))
         }
         "DramaShotVideo" | "StoryForgeSeedance" => {
-            let planned = def.inputs.get("duration").and_then(|v| v.as_i64());
+            // 计划时长：产物上记录的实际请求时长（即梦吸附后）优先，回落节点参数
+            let mut planned = def.inputs.get("duration").and_then(|v| v.as_i64());
             let gen_audio = def.inputs.get("generate_audio").and_then(|v| v.as_bool()).unwrap_or(false);
             let res = def.inputs.get("resolution").and_then(|v| v.as_str()).unwrap_or("720p");
             for v in outs {
                 if let NodeVal::Video(vid) = v {
+                    if let Some(p) = vid.planned {
+                        planned = Some(p);
+                    }
                     return audit_video(ffmpeg, ffprobe, &vid.path, planned, gen_audio, res);
                 }
             }
@@ -1147,8 +1207,9 @@ const SEEDREAM_REF_CNY: f64 = 0.02;
 const SEEDANCE_CNY_PER_SEC: &[(&str, f64)] = &[("480p", 0.67), ("720p", 1.51), ("1080p", 3.74)];
 /// duration=-1（自动时长）时的估算时长
 const SEEDANCE_AUTO_DURATION_S: f64 = 15.0;
-/// 重试缓冲（学 OpenMontage cost_tracker 的 1.3x）：估算区间 [一次成功, ×1.3]
-pub const COST_RETRY_BUFFER: f64 = 1.3;
+/// 重试缓冲上界：每镜最坏 1+AUDIT_MAX_RETRY 次全价生成，"含重试缓冲至多 ¥X" 必须是真上界。
+/// （曾用 1.3x，但确定性上界是 ×3——cap 拦截按假上界放行会超限。运行中另有逐镜 cost_actual 复核兜底。）
+pub const COST_RETRY_BUFFER: f64 = 1.0 + AUDIT_MAX_RETRY as f64;
 
 /// Seedream 单张成本（元）
 fn image_unit_cost(model: &str, size: &str, ref_count: usize) -> f64 {
@@ -1469,9 +1530,22 @@ fn jimeng_sign(
     ]
 }
 
-/// 即梦请求体（纯函数，可单测）：duration→frames（>=10s→241，否则 121）
+/// 即梦只支持两档时长：121 帧=5s、241 帧=10s。请求前必须吸附到这两档，
+/// 否则计划 7-9s / 12s+ 会产出错时长视频 → 自审判废 → 重跑每轮照样错（白烧钱）。
+/// 纯函数可单测；jimeng_payload 与产物 planned 用同一个函数保证口径一致。
+fn jimeng_snap_duration(d: i64) -> i64 {
+    if d <= 0 {
+        5
+    } else if d < 8 {
+        5
+    } else {
+        10
+    }
+}
+
+/// 即梦请求体（纯函数，可单测）：duration 吸附到 5/10 档 → frames（5s→121，10s→241）
 fn jimeng_payload(req: &VideoReq) -> Value {
-    let dur = if req.duration <= 0 { 5 } else { req.duration };
+    let dur = jimeng_snap_duration(req.duration);
     let frames = if dur >= 10 { 241 } else { 121 };
     let ratio = match req.ratio.trim() {
         "" | "adaptive" => "9:16",
@@ -1522,7 +1596,10 @@ async fn jimeng_post(
         .await
         .map_err(|e| format!("即梦请求失败：{e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("即梦请求失败 HTTP {}", resp.status()));
+        // body 里的 message 是排障关键（签名错/权限错/参数错），不能只给状态码
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("即梦请求失败 HTTP {status}：{}", truncate(&body, 300)));
     }
     resp.json::<Value>()
         .await
@@ -1540,6 +1617,13 @@ async fn jimeng_generate(
         [("Action", "CVSync2AsyncSubmitTask"), ("Version", JIMENG_API_VERSION)];
     let poll_query: [(&str, &str); 2] =
         [("Action", "CVSync2AsyncGetResult"), ("Version", JIMENG_API_VERSION)];
+    let snapped = jimeng_snap_duration(req.duration);
+    if snapped != req.duration {
+        ctx.emit(json!({
+            "type": "progress", "node": req.node,
+            "detail": format!("即梦只支持 5s/10s 两档，计划时长 {}s 已吸附为 {}s", req.duration, snapped),
+        }));
+    }
     let submit_body = jimeng_payload(req).to_string().into_bytes();
 
     let created = jimeng_post(&ctx.http, ak, sk, &submit_query, submit_body).await?;
@@ -1559,13 +1643,31 @@ async fn jimeng_generate(
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(25 * 60);
     let started = std::time::Instant::now();
+    // 长轮询网络抖动容忍：连续 3 次查询失败才放弃（同 ARK，任务已计费）
+    let mut poll_fails = 0u32;
     loop {
         if tokio::time::Instant::now() >= deadline {
             return Err(format!("即梦任务超时（task {task_id}）"));
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
         ctx.check_cancel()?;
-        let info = jimeng_post(&ctx.http, ak, sk, &poll_query, poll_body.clone()).await?;
+        let info = match jimeng_post(&ctx.http, ak, sk, &poll_query, poll_body.clone()).await {
+            Ok(v) => {
+                poll_fails = 0;
+                v
+            }
+            Err(e) => {
+                poll_fails += 1;
+                if poll_fails >= 3 {
+                    return Err(format!("即梦查询连续失败 {poll_fails} 次，放弃等待（task {task_id}）：{e}"));
+                }
+                ctx.emit(json!({
+                    "type": "progress", "node": req.node,
+                    "detail": format!("查询抖动（{poll_fails}/3），继续等待：{}", truncate(&e, 120)),
+                }));
+                continue;
+            }
+        };
         let status = info.pointer("/data/status").and_then(|v| v.as_str()).unwrap_or("").to_string();
         if !status.is_empty() {
             let secs = started.elapsed().as_secs();
@@ -1581,9 +1683,9 @@ async fn jimeng_generate(
             let path = ctx.tmp_dir.join(format!("jimeng_{}.mp4", new_prompt_id()));
             std::fs::write(&path, &bytes).map_err(|e| format!("落盘视频失败：{e}"))?;
             let duration = ffprobe_duration(&ctx.ffprobe, &path);
-            return Ok(VideoVal { path, duration, provider: "jimeng".into() });
+            return Ok(VideoVal { path, duration, provider: "jimeng".into(), planned: Some(snapped) });
         }
-        if matches!(status.as_str(), "not_found" | "expired") {
+        if matches!(status.as_str(), "not_found" | "expired" | "failed" | "queue_error") {
             return Err(format!("即梦任务无效（{status}）: {}", truncate(&info.to_string(), 400)));
         }
     }
@@ -2159,7 +2261,7 @@ async fn execute_node(
                 ));
             }
             let duration = ffprobe_duration(&ctx.ffprobe, &path);
-            Ok(vec![NodeVal::Video(Arc::new(VideoVal { path, duration, provider: "local".into() }))])
+            Ok(vec![NodeVal::Video(Arc::new(VideoVal { path, duration, provider: "local".into(), planned: None }))])
         }
 
         /* ---------------- 落盘：Save* ---------------- */
@@ -2386,17 +2488,30 @@ pub fn kernel_submit(
                                 &outs,
                             );
                             ctx.record_verification(nid, &audit, attempt);
-                            ctx.emit(json!({ "type": "progress", "node": nid, "detail": audit.summary() }));
-                            match retry_decision(audit.ok, attempt, ctx.run.cancelled()) {
+                            ctx.emit(json!({
+                                "type": "progress", "node": nid,
+                                "detail": audit.summary(),
+                                "reason": if audit.ok { Value::Null } else { json!(audit.fail()) },
+                            }));
+                            // P0-2 预算治理：cap 模式下重跑前复核累计花费，超限立即止损（提交时那次拦截只看估算）
+                            let over_budget = ctx.run.budget_limit > 0.0
+                                && ctx.run.budget_mode == "cap"
+                                && *ctx.run.cost_actual.lock().unwrap() > ctx.run.budget_limit;
+                            match retry_decision(audit.ok, attempt, ctx.run.cancelled(), audit.deterministic || over_budget) {
                                 0 => break, // 通过 / 已取消
                                 2 => {
-                                    // 重试上限：按原样保留并明说
+                                    // 确定性失败（重跑必复现）/ 重试上限 / 预算超限：按原样保留并明说
+                                    let why = if audit.deterministic {
+                                        "确定性失败（参数级，重跑必复现）"
+                                    } else if over_budget {
+                                        "累计花费已超单次上限"
+                                    } else {
+                                        "自审不合格已达重试上限"
+                                    };
                                     ctx.emit(json!({
                                         "type": "progress", "node": nid,
-                                        "detail": format!(
-                                            "自审不合格已达重试上限（{AUDIT_MAX_RETRY} 轮），按原样保留：{}",
-                                            audit.fail()
-                                        ),
+                                        "detail": format!("{why}（{AUDIT_MAX_RETRY} 轮上限），按原样保留：{}", audit.fail()),
+                                        "reason": json!(audit.fail()),
                                     }));
                                     break;
                                 }
@@ -2408,6 +2523,7 @@ pub fn kernel_submit(
                                             "自审不合格（{}），自动重跑（第 {attempt}/{AUDIT_MAX_RETRY} 轮）",
                                             audit.fail()
                                         ),
+                                        "reason": json!(audit.fail()),
                                     }));
                                     outs = execute_node(&ctx, nid, &nodes, &mut produced, &mut assets_counter)
                                         .await
@@ -2465,7 +2581,8 @@ pub fn kernel_history(prompt_id: String) -> Value {
             entry.insert(
                 "status".into(),
                 json!({
-                    "status_str": if status_str == "error" { "error" } else { "success" },
+                    // running 不能报 success（completed 才是唯一完成标志，status_str 谎报会误导历史面板）
+                    "status_str": if status_str == "error" { "error" } else if completed { "success" } else { "running" },
                     "completed": completed,
                     "messages": [],
                 }),
@@ -2645,16 +2762,21 @@ mod audit_tests {
         assert!(!a.ok);
         assert!(a.failed.iter().any(|f| f.contains("音轨")), "{:?}", a.failed);
         assert!(a.failed.iter().any(|f| f.contains("分辨率")), "{:?}", a.failed);
+        assert!(a.deterministic, "音轨/分辨率失败是参数级，必须标记 deterministic");
     }
 
     #[test]
     fn retry_decision_rules() {
         // 通过 / 取消 → 收货；连续失败（attempt 0,1,2）→ 2 轮后收货+警告
-        assert_eq!(retry_decision(true, 0, false), 0);
-        assert_eq!(retry_decision(false, 0, true), 0);
-        assert_eq!(retry_decision(false, 0, false), 1);
-        assert_eq!(retry_decision(false, 1, false), 1);
-        assert_eq!(retry_decision(false, 2, false), 2, "第 3 次失败必须止损");
+        assert_eq!(retry_decision(true, 0, false, false), 0);
+        assert_eq!(retry_decision(false, 0, true, false), 0);
+        assert_eq!(retry_decision(false, 0, false, false), 1);
+        assert_eq!(retry_decision(false, 1, false, false), 1);
+        assert_eq!(retry_decision(false, 2, false, false), 2, "第 3 次失败必须止损");
+        // 确定性失败：重跑参数不变必然复现，直接止损不烧钱
+        assert_eq!(retry_decision(false, 0, false, true), 2, "确定性失败不进重跑");
+        // 预算超限：走同一个止损出口（调用方把 over_budget 并进 deterministic）
+        assert_eq!(retry_decision(false, 0, false, true), 2);
     }
 
     #[test]
@@ -2808,6 +2930,17 @@ mod audit_tests {
         assert_eq!(p["aspect_ratio"], "9:16", "adaptive 映射成竖屏");
         assert_eq!(p["req_key"], "jimeng_ti2v_v30_pro");
         assert!(p.get("image_urls").is_none(), "没有首帧就不带 image_urls");
+
+        // 时长吸附：7-9s → 5s 档；8s 以上 → 10s 档（jimeng_snap_duration）
+        assert_eq!(jimeng_snap_duration(0), 5);
+        assert_eq!(jimeng_snap_duration(-1), 5);
+        assert_eq!(jimeng_snap_duration(7), 5);
+        assert_eq!(jimeng_snap_duration(8), 10);
+        assert_eq!(jimeng_snap_duration(12), 10);
+        let p = jimeng_payload(&video_req(|r| {
+            r.duration = 8;
+        }));
+        assert_eq!(p["frames"], 241, "8s 吸附到 10s 档，不能产出 5s 片");
 
         let p = jimeng_payload(&video_req(|r| {
             r.duration = 12;

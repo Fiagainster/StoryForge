@@ -180,7 +180,6 @@ export interface AppConfig {
   projectRoot: string;
   comfyDir: string;
   comfyBase: string;
-  venvPython: string;
   comfyPort: number;
   llm: { baseUrl: string; apiKey: string; model: string };
   ark: { apiKey: string };
@@ -214,16 +213,4 @@ export interface ProjectMeta {
   name: string;
   path: string;
   updatedAt: number;
-}
-
-/** project.json 的内容：项目 = 画布 + 多条会话（会话里带执行记录） */
-export interface ProjectData {
-  schemaVersion: number;
-  id: string;
-  name: string;
-  draft: unknown;
-  sessions: unknown[];
-  activeId: string;
-  lastPrompt?: string | null;
-  savedAt?: number;
 }

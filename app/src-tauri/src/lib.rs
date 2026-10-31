@@ -862,8 +862,11 @@ async fn llm_chat_stream(
         body["response_format"] = json!({ "type": "json_object" });
     }
 
+    // 流式响应不能用总超时：reasoning 模型长推理可超 10 分钟，会被硬切在半途。
+    // 只设连接超时 + 读超时（chunk 间隔），整体时长交给前端取消控制。
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(600))
+        .connect_timeout(Duration::from_secs(30))
+        .read_timeout(Duration::from_secs(120))
         .build()
         .map_err(|e| e.to_string())?;
     let mut resp = client
@@ -1061,7 +1064,10 @@ fn kernel_submit_cmd(
 
     let ffmpeg = kernel::find_tool(&tool_candidates(&app), &root, "ffmpeg")
         .ok_or("找不到 ffmpeg（占位图 / 缩放 / 尾帧都靠它）。请把 ffmpeg.exe 放进项目根的 bin/ 文件夹，或重新安装完整版。")?;
-    let ffprobe = kernel::find_tool(&tool_candidates(&app), &root, "ffprobe").unwrap_or(ffmpeg.clone());
+    // ffprobe 缺失绝不能拿 ffmpeg 路径顶替：用 ffmpeg 参数跑 ffprobe 必失败 → 每条视频自审判废
+    // → 白烧 2 轮付费重跑还报"文件损坏"。缺失就硬报错，与 ffmpeg 同级处理。
+    let ffprobe = kernel::find_tool(&tool_candidates(&app), &root, "ffprobe")
+        .ok_or("找不到 ffprobe（时长 / 分辨率 / 音轨自审都靠它）。请把 ffprobe.exe 放进项目根的 bin/ 文件夹（与 ffmpeg.exe 同目录），或重新安装完整版。")?;
 
     // P0-2 预算治理：单次金额上限 + 模式（observe=只显示 / warn=超限提醒 / cap=超限拦截）
     let (budget_limit, budget_mode) = {
@@ -1098,10 +1104,20 @@ fn export_aspect_cmd(
     let out_dir = workspace.join("output");
     let mut src = out_dir.clone();
     if let Some(sf) = subfolder.as_deref() {
-        if !sf.trim().is_empty() && sf.contains("..") {
+        let sf = sf.trim().trim_start_matches(['/', '\\']);
+        // Windows 下 PathBuf::push 遇盘符/绝对路径会整体替换——subfolder 只允许纯目录名片段
+        if sf.is_empty() {
+            // 空子目录 = 直接在 output/ 下
+        } else if sf.contains("..")
+            || sf.contains(':')
+            || sf.contains('/')
+            || sf.contains('\\')
+            || Path::new(sf).is_absolute()
+        {
             return Err("非法子目录".into());
+        } else {
+            src.push(sf);
         }
-        src.push(sf.trim().trim_start_matches(['/', '\\']));
     }
     src.push(&filename);
     if !src.is_file() {

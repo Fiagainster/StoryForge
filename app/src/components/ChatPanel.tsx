@@ -311,7 +311,14 @@ export function ChatPanel({ width, onCollapse }: { width: number; onCollapse: ()
                         className="size-6 opacity-0 group-hover:opacity-100 hover:text-[var(--err)]"
                         onClick={(e) => {
                           e.stopPropagation();
-                          deleteSession(s.id);
+                          // 删会话会连带删掉这个会话名下的全部执行记录，不可恢复——高危操作必须确认
+                          const n = s.runs.length;
+                          const ok = window.confirm(
+                            n
+                              ? `删除「${s.title}」？这个会话名下还有 ${n} 次执行记录（含分镜产物引用）会一起删掉，删了找不回来。`
+                              : `删除「${s.title}」？`
+                          );
+                          if (ok) deleteSession(s.id);
                         }}
                       >
                         {I.trash(12)}

@@ -31,7 +31,8 @@ export const CAMERA_MOVES: CameraMove[] = [
 ];
 
 const MAX_CHARACTERS = 4;
-const MAX_SHOTS = 6;
+/** 镜头数不在这里截断：上限归 applyBudget（可配置、会出警告），这里只做异常兜底 */
+const MAX_SHOTS = 60;
 const MAX_SHOT_SECONDS = 15;
 
 export interface ParsedPlan {

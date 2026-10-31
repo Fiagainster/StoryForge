@@ -1108,12 +1108,15 @@ export function CanvasGraph({
       }
       if ((e.key === "Delete" || e.key === "Backspace") && editing) {
         if (selLink) {
-          detach(selLink.id, selLink.key);
-          setSelLink(null);
-          e.preventDefault();
+          // 生成中不动图：跑着的记录和画布必须对得上（工具栏按钮有 disabled，键盘也要同一道闸）
+          if (!busy) {
+            detach(selLink.id, selLink.key);
+            setSelLink(null);
+            e.preventDefault();
+          }
           return;
         }
-        if (selIds.length) {
+        if (selIds.length && !busy) {
           removeNodes(selIds);
           e.preventDefault();
         }
@@ -1131,7 +1134,7 @@ export function CanvasGraph({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [editing, selIds, selLink, graph]);
+  }, [editing, selIds, selLink, graph, busy]);
 
   const run = () => {
     if (busy) return;

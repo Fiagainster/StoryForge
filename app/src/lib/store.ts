@@ -12,7 +12,6 @@ import type {
   EnvReport,
   LogEntry,
   RunRecord,
-  RunUsage,
   ProjectMeta,
 } from "../types";
 import * as api from "./api";
@@ -121,20 +120,10 @@ interface Store {
   /** 停掉正在跑的这一轮对话（掐断模型输出，画布不动） */
   stopTurn: () => Promise<void>;
 
-  /** 引擎空闲多久自动停（分钟），0 = 不自动停 */
-  idleStopMin: number;
-  /** 已排上自动停的时间点（null = 没排） */
-  idleStopAt: number | null;
-  /** 跑完之后挂一个空闲计时：开着就吃显存，人走了不该一直烧着 */
-  armIdleStop: () => void;
-  disarmIdleStop: () => void;
-  setIdleStopMin: (min: number) => void;
-
   /** 内部：确保内核就绪（常驻，瞬时完成） */
   ensureComfy: () => Promise<boolean>;
   init: () => Promise<void>;
   refreshComfy: () => Promise<void>;
-  startComfy: () => Promise<void>;
   stopComfy: () => Promise<void>;
   send: (text: string) => Promise<void>;
   /** 人在画布上改图 */
@@ -149,7 +138,6 @@ interface Store {
   /** 拖动分镜卡改出片顺序：只动这一版的展示与合成顺序，不重跑、不动文件 */
   moveShot: (runId: string, from: number, to: number) => void;
   resetShotOrder: (runId: string) => void;
-  rerunGraph: (runId: string, graph: ComfyGraph) => Promise<void>;
   /** 把一次计划里的所有镜头视频合成成片 */
   assembleShots: (runId: string) => Promise<void>;
   /** 删除一条执行记录（产物文件保留在磁盘） */
@@ -241,16 +229,6 @@ const starterDoc = (): CanvasDoc => ({
     },
   },
 });
-
-/** 从产物反推用量：这一版没有 LLM 开销，图和视频秒数按产物数出来 */
-const usageFromAssets = (assets: Asset[]): RunUsage => {
-  const isVid = (a: Asset) => /\.(mp4|webm|mov|mkv)(?:[?&#]|$)/i.test(a.filename || "");
-  return {
-    llmTokens: 0,
-    images: assets.filter((a) => !isVid(a)).length,
-    videoSeconds: Math.round(assets.reduce((n, a) => n + (a.duration || 0), 0) * 10) / 10,
-  };
-};
 
 /** 一条执行记录 → 画布：执行完就把画布切到这张"已经是结果"的图上 */
 const docFromRun = (run: RunRecord): CanvasDoc => ({
@@ -432,20 +410,6 @@ const uid = () =>
 export const useStore = create<Store>((set, get) => {
   const initialSession = freshSession();
 
-  /** 空闲自动停的计时器：放模块级，切页面也不会重复挂 */
-  let idleTimer: number | null = null;
-  /** 这个偏好只跟本机有关，存本地就行，不进后端配置 */
-  const IDLE_KEY = "sf.idleStopMin";
-  const savedIdle = (() => {
-    try {
-      const v = localStorage.getItem(IDLE_KEY);
-      const n = v === null ? NaN : Number(v);
-      return Number.isFinite(n) && n >= 0 ? n : 5;
-    } catch {
-      return 5;
-    }
-  })();
-
   /* ---------------- 流式一轮回复的辅助 ---------------- */
 
   const patchMsg = (id: string, fn: (m: ChatMessage) => ChatMessage) =>
@@ -598,8 +562,6 @@ export const useStore = create<Store>((set, get) => {
   comfy: null,
   outDir: null,
   starting: false,
-  idleStopMin: savedIdle,
-  idleStopAt: null,
   runNodes: {},
   runNow: null,
   messages: initialSession.messages,
@@ -700,8 +662,6 @@ export const useStore = create<Store>((set, get) => {
         .comfyOutputDir()
         .then((dir) => set({ outDir: dir }))
         .catch(() => set({ outDir: null }));
-      // 引擎还开着（上次没关或人手动启的）：先把空闲计时挂上，别让它无声无息占着内存
-      if (comfy.running) get().armIdleStop();
       get().addLog(
         "info",
         `根目录：${env.projectRoot}｜工作区：${env.comfyBaseExists ? "已就绪" : "缺失"}｜提示词：${
@@ -740,8 +700,11 @@ export const useStore = create<Store>((set, get) => {
   cancelRun: async () => {
     set({ cancelRequested: true, stage: "正在停止" });
     get().addLog("warn", "已点停止：正在中断当前执行");
+    // 对话流式阶段点画布停止：模型流也要掐断
+    await api.llmAbort().catch(() => {});
     await get().stopComfy();
-    set({ starting: false, busy: false, runNodes: {}, runNow: null, stage: "", error: null });
+    // busy/runNodes/runNow 不在这里清：提前放掉 busy 会开出并发执行窗口，
+    // 两个回合的事件会互相写 runNodes。统一由在跑回合自己的收尾分支清理。
   },
 
   stopTurn: async () => {
@@ -757,22 +720,8 @@ export const useStore = create<Store>((set, get) => {
     await api.llmAbort();
   },
 
-  startComfy: async () => {
-    // 内核常驻，没有启动过程：确认状态即可
-    try {
-      await api.comfyStart();
-      const comfy = await api.comfyStatus();
-      set({ comfy, starting: false });
-      get().addLog("info", "内核已就绪");
-    } catch (e) {
-      set({ starting: false, error: String(e) });
-      get().addLog("error", `内核状态确认失败：${e}`);
-    }
-  },
-
   stopComfy: async () => {
     // 「停止」的真实语义：掐掉当前在跑的执行（内核没有进程可停）
-    get().disarmIdleStop();
     set({ starting: false });
     try {
       await api.comfyStop();
@@ -780,31 +729,6 @@ export const useStore = create<Store>((set, get) => {
     } catch (e) {
       get().addLog("error", `中断失败：${e}`);
     }
-  },
-
-  setIdleStopMin: (min) => {
-    const v = Math.max(0, Math.min(120, Math.round(min)));
-    set({ idleStopMin: v });
-    try {
-      localStorage.setItem(IDLE_KEY, String(v));
-    } catch {
-      /* 存不了就算了，下次开还是默认值 */
-    }
-    if (v > 0) get().armIdleStop();
-    else get().disarmIdleStop();
-  },
-
-  disarmIdleStop: () => {
-    if (idleTimer !== null) {
-      window.clearTimeout(idleTimer);
-      idleTimer = null;
-    }
-    if (get().idleStopAt !== null) set({ idleStopAt: null });
-  },
-
-  armIdleStop: () => {
-    // 内核时代没有进程占显存，空闲自动停退役：留函数名是为了设置页的兼容
-    get().disarmIdleStop();
   },
 
   send: async (text) => {
@@ -1129,7 +1053,6 @@ export const useStore = create<Store>((set, get) => {
     }
 
     const t0 = Date.now();
-    get().disarmIdleStop();
     // 状态跟着一起变成"生成中"：标签、按钮、节点进度说的是同一件事
     set({
       busy: true,
@@ -1156,14 +1079,14 @@ export const useStore = create<Store>((set, get) => {
         return;
       }
       if (!ok) {
-        set((st) => ({
+        // 内容本身没问题，只是内核没就绪：标 error 会把画布顶成"上次失败"，误导
+        set({
           busy: false,
           runNodes: {},
           runNow: null,
           stage: "",
           error: "内核未就绪，画布内容已保留",
-          draft: { ...st.draft, status: "error" },
-        }));
+        });
         return;
       }
       const { config } = get();
@@ -1178,6 +1101,13 @@ export const useStore = create<Store>((set, get) => {
         onDelta: h.onDelta,
         onStep: h.onStep,
         onNode: h.onNode,
+      }, undefined, {
+        // 主路径也要沉淀：内核自审不合格的原因进经验记忆（此前只在单镜重跑路径活着）
+        onLesson: (lesson) => void get().addLearning(lesson),
+        // 执行失败自愈：错误喂回模型用 ops 打补丁重试（保留人的手改，不重编译）
+        repairOnFailure: !!config?.llm?.apiKey,
+        hasModelKey: !!config?.llm?.apiKey,
+        lessons: config?.memory?.learnings ?? [],
       });
 
       endTurn(turnId, {
@@ -1186,12 +1116,12 @@ export const useStore = create<Store>((set, get) => {
         graph: result.graph,
       });
 
-      // 执行记录补上计划与用量：分镜页要按计划渲染，用量要能算账
+      // 执行记录补上计划与用量：分镜页要按计划渲染；用量直接用内核算好的（含 costCny），
+      // 本地重建会把实际金额覆盖成 undefined，资产页"花费"永远显示 —
       const published = result.run
         ? {
             ...result.run,
             plan: doc.plan ?? result.run.plan,
-            usage: usageFromAssets(result.run.assets),
             note: result.run.note || doc.title,
           }
         : undefined;
@@ -1212,8 +1142,6 @@ export const useStore = create<Store>((set, get) => {
           : // 没产出记录（执行报错）也要把"生成中"收回来，别让它一直转着
             { ...s.draft, status: result.error ? "error" : "draft" },
       }));
-      // 跑完就挂上空闲计时：引擎开着吃显存，人走了不该一直烧
-      get().armIdleStop();
     } catch (e) {
       const stopped = get().cancelRequested;
       set((s) => ({
@@ -1276,7 +1204,6 @@ export const useStore = create<Store>((set, get) => {
           ? { ...docFromRun(result.run), plan: s.draft.plan, ts: Date.now() }
           : s.draft,
       }));
-      get().armIdleStop();
     } catch (e) {
       if (msgId) endTurn(msgId, { reply: `执行失败：${e}`, error: String(e) });
       set((s) => ({
@@ -1304,11 +1231,23 @@ export const useStore = create<Store>((set, get) => {
   addLearning: async (lesson) => {
     const trimmed = lesson.trim().slice(0, 200);
     if (!trimmed) return;
-    const { config } = get();
-    const cur = config?.memory?.learnings ?? [];
-    if (cur.includes(trimmed)) return;
+    // 原子更新：先在 set 里基于最新 state 算，避免两条经验接连到达时第二次基于旧 config
+    // 整体覆盖掉第一条（读-改-写竞态会静默丢经验）
+    let changed = false;
+    set((s) => {
+      const cur = s.config?.memory?.learnings ?? [];
+      if (cur.includes(trimmed)) return s;
+      changed = true;
+      return {
+        config: {
+          ...s.config,
+          memory: { learnings: [trimmed, ...cur].slice(0, 30) },
+        } as AppConfig,
+      };
+    });
+    if (!changed) return;
     get().addLog("info", `经验已沉淀：${trimmed}`);
-    await get().saveConfig({ memory: { learnings: [trimmed, ...cur].slice(0, 30) } } as any);
+    await get().saveConfig({ memory: { learnings: get().config?.memory?.learnings } } as any);
   },
 
   clearLearnings: async () => {
@@ -1385,7 +1324,6 @@ export const useStore = create<Store>((set, get) => {
         ],
       }));
       get().addLog("info", `成片已合成：${res.filename}`);
-      get().armIdleStop();
     } catch (e) {
       set((s) => ({
         busy: false,
@@ -1417,52 +1355,13 @@ export const useStore = create<Store>((set, get) => {
       set({ error: "环境信息还没有就绪" });
       return;
     }
-    const dir = `${env.projectRoot}\${env.comfyBase}\output`;
+    // 不能写 `${env.projectRoot}\${env.comfyBase}\output`：`\$` 是转义，拼出来的是字面量
+    const dir = joinPath(env.projectRoot, env.comfyBase, "output");
     try {
       await api.openInExplorer(dir);
     } catch (e) {
       get().addLog("error", `打开目录失败：${e}`);
     }
-  },
-
-  rerunGraph: async (runId, graph) => {
-    if (get().busy) return;
-    const source = get().runs.find((r) => r.id === runId);
-    if (!source) return;
-    set({ busy: true, runNodes: {}, runNow: null, stage: "校验修改后的图", error: null });
-
-    const ok = await get().ensureComfy();
-    if (!ok) {
-      set((s) => ({
-        busy: false,
-        runNodes: {},
-        runNow: null,
-        stage: "",
-        error: "内核未就绪，改动已保留在画布上",
-        pendingGraph: { runId, graph },
-      }));
-      return;
-    }
-    const { config } = get();
-    const c = client(config, get().comfy);
-    const turnId = beginTurn();
-    const h = makeHandlers(turnId);
-    await get().runAndAnnounce(
-      executeEditedGraph(graph, c, {
-        onLog: (level, msg) => get().addLog(level, msg),
-        onStage: (stage) => set({ stage }),
-        onDelta: h.onDelta,
-        onStep: h.onStep,
-        onNode: h.onNode,
-      }).then((result) => {
-        // 人工改动回注对话：保留原计划的分镜结构，标注参数已被人改过
-        if (result.run && source.plan) {
-          result.run = { ...result.run, plan: source.plan };
-        }
-        return result;
-      }),
-      turnId
-    );
   },
 
   rerunShot: async (runId, shotIndex) => {
@@ -1508,7 +1407,15 @@ export const useStore = create<Store>((set, get) => {
     try {
       const ok = await get().ensureComfy();
       if (!ok) {
-        set({ busy: false, runNodes: {}, runNow: null, stage: "", error: "内核未就绪，请检查环境后重试" });
+        set({
+          busy: false,
+          runNodes: {},
+          runNow: null,
+          stage: "",
+          error: "内核未就绪，请检查环境后重试",
+          // 画布恢复整版原图
+          draft: { ...docFromRun(run), status: "draft", ts: Date.now() },
+        });
         return;
       }
       const { config } = get();
@@ -1566,7 +1473,10 @@ export const useStore = create<Store>((set, get) => {
       if (result.run && updatedRun && !get().cancelRequested) {
         set({ draft: { ...docFromRun(updatedRun), ts: Date.now() } });
       } else if (!result.run) {
-        set((s) => ({ draft: { ...s.draft, status: result.error ? "error" : "done" } }));
+        // 失败也要把整版图还回来：单镜预览图不是用户的工作现场，留在画布上像数据丢了
+        set((s) => ({
+          draft: { ...docFromRun(run), status: result.error ? "error" : "draft", ts: Date.now() },
+        }));
       }
 
       endTurn(turnId, {
@@ -1595,9 +1505,8 @@ export const useStore = create<Store>((set, get) => {
         stage: "",
         cancelRequested: false,
         error: stopped ? null : String(e),
-        draft: stopped
-          ? { ...s.draft, status: "draft" }
-          : { ...s.draft, status: "error" },
+        // 取消/失败都恢复整版原图：单镜预览图只是重跑过程的临时现场
+        draft: { ...docFromRun(run), status: stopped ? "draft" : "error", ts: Date.now() },
       }));
       if (stopped) {
         endTurn(beginTurn(), { reply: "重跑取消了，画布保持原样。" });

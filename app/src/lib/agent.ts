@@ -9,7 +9,7 @@ import type {
 } from "../types";
 import { llmChatStream } from "./api";
 import type { ComfyClient, WatchEvent } from "./comfy";
-import { BLOCKED_INDEX, NODES, NODE_INDEX, LIB_STATS, MISSING_CORE } from "./nodeSearch";
+import { BLOCKED_INDEX, NODES, NODE_INDEX } from "./nodeSearch";
 import { applyBudget, buildRepairMessages, compilePlan, parsePlan, parseRepair, planStats } from "./plan";
 import { planRisk, RISK_VERDICT_LABEL } from "./planRisk";
 import type { Budget } from "./plan";
@@ -340,8 +340,12 @@ async function submitAndWait(
   if (cost) usage.costCny = Math.round(cost.actual * 100) / 100;
   if (auditReasons.size) {
     const lesson = `内核自审发现：${[...auditReasons].join("；")}——出计划时规避同类缺陷`;
-    log("info", `沉淀经验：${lesson}`);
-    cb.onLesson?.(lesson);
+    if (cb.onLesson) {
+      log("info", `沉淀经验：${lesson}`);
+      cb.onLesson(lesson);
+    } else {
+      log("info", `自审发现（未接经验沉淀）：${lesson}`);
+    }
   }
   log(
     "info",
@@ -614,12 +618,23 @@ function stage(cb: RunCallbacks, s: string) {
 /**
  * 人在图上改：把（可能被手动编辑过的）节点图直接校验并执行。
  * 不走计划编译——人改的就是最终图。
+ * 执行失败时可自愈：把错误喂回模型用 ops 在图上打补丁（保留人的手改），再试一次。
  */
 export async function executeEditedGraph(
   graph: ComfyGraph,
   client: ComfyClient | null,
   cb: RunCallbacks = {},
-  note?: string
+  note?: string,
+  opts?: {
+    /** 自审不合格沉淀经验的出口（主路径也要接上，否则内核收集了也白收集） */
+    onLesson?: (lesson: string) => void;
+    /** 执行失败时自动修复图（最多 1 次） */
+    repairOnFailure?: boolean;
+    /** 对话模型可用（决定失败后能否自动修复） */
+    hasModelKey?: boolean;
+    /** 已沉淀的经验，修复时一并注入 */
+    lessons?: string[];
+  }
 ): Promise<AgentResult> {
   const log = cb.onLog || (() => {});
   const stage = cb.onStage || (() => {});
@@ -642,7 +657,7 @@ export async function executeEditedGraph(
   }
   stage("生成中");
   try {
-    const run = await submitAndWait(checked, client, cb, note ?? "按画布执行", 0);
+    const run = await submitAndWait(checked, client, { ...cb, onLesson: opts?.onLesson }, note ?? "按画布执行", 0);
     return {
       reply: `画布已执行（${Object.keys(checked).length} 个节点），产物在「分镜」里`,
       graph: checked,
@@ -650,6 +665,53 @@ export async function executeEditedGraph(
     };
   } catch (e) {
     const msg = String(e);
+    // 自愈闭环：错误喂回模型 → ops 在当前图（含手改）上打补丁 → 校验 → 重试一次
+    if (opts?.repairOnFailure && opts?.hasModelKey) {
+      log("warn", "执行失败，把错误喂回模型尝试修复图…");
+      try {
+        const catalog = NODES.map((n) => `${n.n} — ${n.d} · ${n.c}`).join("\n");
+        const messages = buildGraphEditMessages(
+          checked,
+          `这轮执行失败了，请只针对下面这个错误修改图，小步改动：\n${msg}`,
+          catalog,
+          opts.lessons ?? []
+        );
+        const resp = await llmJsonChat(messages, cb, "自动修复图");
+        const parsed = parseJsonLoose(resp.content ?? "");
+        const ops = Array.isArray(parsed?.ops) && parsed.ops.length ? parsed.ops : null;
+        if (!ops) throw new Error("模型没有给出可用的修改");
+        const opsCtx = {
+          cardOf: (ct: string) => {
+            const c = NODE_INDEX.get(ct);
+            return c ? { display: c.d, in: c.in, out: c.out } : undefined;
+          },
+        };
+        const { graph: edited, errors: opErrors } = applyGraphOps(checked, ops, opsCtx);
+        if (opErrors.length) throw new Error(`修改没应用上：${opErrors[0]}`);
+        const v = validateAndRepair(edited);
+        if (v.errors.length) throw new Error(`修复后的图没通过校验：${v.errors[0]}`);
+        log("info", "修复图已应用，重试执行…");
+        const run2 = await submitAndWait(
+          v.graph,
+          client,
+          { ...cb, onLesson: opts.onLesson },
+          `${note ?? "按画布执行"}（自动修复重试）`,
+          0
+        );
+        if (opts.onLesson) {
+          const lesson = `画布执行失败后修复成功：${msg.slice(0, 120)}——出图参数时规避同类错误`;
+          log("info", `沉淀经验：${lesson}`);
+          opts.onLesson(lesson);
+        }
+        return {
+          reply: `执行失败后已自动修复重试（${parsed.reply || "模型改了图上的参数"}），产物在「分镜」里；修复后的图已同步到画布。`,
+          graph: v.graph,
+          run: run2,
+        };
+      } catch (fixErr) {
+        log("warn", `自动修复失败：${fixErr}`);
+      }
+    }
     log("error", msg);
     return { reply: `执行失败：${msg}`, graph: checked, error: msg };
   }
@@ -865,8 +927,6 @@ export interface AgentResult {
   run?: RunRecord;
   degraded?: boolean;
   error?: string;
-  /** 计划已就绪，等待用户确认后再执行 */
-  needsConfirm?: boolean;
   /** 智能体通过 ops 协议改了现有图，改动进画布等人审查 */
   graphEdited?: boolean;
   /** 计划是"往后追加新镜"而不是整版重铺：store 编译时从现有最大镜号+1 接着编 */
@@ -1343,7 +1403,6 @@ export async function runAgentTurn(
         planAlt,
         append: parsed.append === true,
         degraded,
-        needsConfirm: true,
         usage: { llmTokens, images: 0, videoSeconds: 0 },
       });
     }
@@ -1420,12 +1479,4 @@ export async function runAgentTurn(
     graphEdited: true,
     degraded,
   });
-}
-
-/** 节点库概览，用于界面上展示 */
-export function librarySummary(): string {
-  const parts = [`可用 ${LIB_STATS.usable}`, `需权重 ${LIB_STATS.needWeights}`, `第三方 ${LIB_STATS.partner}`];
-  let s = parts.join(" · ");
-  if (MISSING_CORE.length) s += `（缺 ${MISSING_CORE.length} 个核心节点）`;
-  return s;
 }
