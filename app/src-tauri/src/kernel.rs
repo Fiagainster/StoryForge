@@ -1,9 +1,10 @@
 //! StoryForge 原生内核：替代 ComfyUI 的本地执行器。
 //!
 //! 画布永远是 ComfyUI API 格式的图（"画布是唯一真相"），内核只做三件事：
-//!   1. 拓扑执行图里的节点（只认 StoryForge 自家的 10 个节点，其余一律拒绝）；
+//!   1. 拓扑执行图里的节点（只认 StoryForge 自家的 12 个节点，其余一律拒绝）；
 //!   2. 需要生成力的节点直连火山 ARK（文生图 / 图生视频，逻辑对齐原 nodes.py）；
-//!   3. 像素级杂活（占位图、缩放、抽尾帧）交给随包分发的 ffmpeg。
+//!   3. 像素级杂活（占位图、缩放、抽尾帧）交给随包分发的 ffmpeg；
+//!   4. 生成产物自审（全黑/全白/时长/分辨率/音轨），不合格自动重跑该镜（最多 2 轮）。
 //!
 //! 对前端的契约与 ComfyUI 完全同构：
 //!   - 提交 → kernel_submit，返回 prompt_id；
@@ -204,6 +205,27 @@ impl RunCtx {
         } else {
             Ok(())
         }
+    }
+
+    /// P0-1：自审结果写进历史。挂在生成节点名下的 "verification" 字段，
+    /// 前端只读 images/videos 数组所以形状不受影响，资产页 / 历史面板可查。
+    fn record_verification(&self, node: &str, audit: &Audit, attempt: u32) {
+        let mut outputs = self.run.outputs.lock().unwrap();
+        let entry = outputs
+            .as_object_mut()
+            .unwrap()
+            .entry(node.to_string())
+            .or_insert_with(|| json!({}));
+        entry.as_object_mut().unwrap().insert(
+            "verification".into(),
+            json!({
+                "ok": audit.ok,
+                "attempt": attempt,
+                "failed": audit.failed,
+                "notes": audit.notes,
+                "details": audit.details,
+            }),
+        );
     }
 
     /// 把产物登记进历史（形状对齐 ComfyUI 的 outputs）
@@ -643,6 +665,331 @@ pub fn ffmpeg_concat(ffmpeg: &Path, inputs: &[PathBuf], out_path: &Path) -> Resu
     );
     let _ = std::fs::remove_file(&list_path);
     result
+}
+
+// ---------------------------------------------------------------------------
+// P0-1 产物自审：生成节点出产物后立即质检，不合格自动重跑（最多 2 轮，
+// 学 OpenMontage reviewer 协议的"revise 最多 2 轮后 pass with warnings"，防无限烧钱）
+// ---------------------------------------------------------------------------
+
+/// 参与自审的节点 = 全部 ARK 生成节点。本地 ffmpeg 节点的输出是确定性的，不用查。
+const AUDIT_GEN_NODES: &[&str] = &[
+    "DramaCharacter",
+    "DramaShotFrame",
+    "StoryForgeSeedream",
+    "DramaShotVideo",
+    "StoryForgeSeedance",
+];
+
+/// 自审不合格后的自动重跑轮数上限（不含首次生成）
+const AUDIT_MAX_RETRY: u32 = 2;
+
+/// 全黑判定阈值（signalstats YAVG，YUV limited range：纯黑=16，夜戏安全余量）
+const DARK_LIMIT: f64 = 18.0;
+/// 全白判定阈值（YUV limited range：纯白=235）
+const BRIGHT_LIMIT: f64 = 232.0;
+/// 视频实测时长与计划时长的允许偏差（秒）
+const DURATION_TOLERANCE: f64 = 1.5;
+/// 分辨率短边允许下探比例（Seedance ratio=adaptive 时可能微调）
+const RESOLUTION_TOLERANCE: f64 = 0.85;
+
+struct Audit {
+    ok: bool,
+    failed: Vec<String>,
+    notes: Vec<String>,
+    details: Value,
+}
+
+impl Audit {
+    fn pass(notes: Vec<String>, details: Value) -> Self {
+        Self { ok: true, failed: Vec::new(), notes, details }
+    }
+    fn fail(&self) -> String {
+        self.failed.join("；")
+    }
+    fn summary(&self) -> String {
+        if self.ok {
+            if self.notes.is_empty() {
+                "自审通过".into()
+            } else {
+                format!("自审通过：{}", self.notes.join("；"))
+            }
+        } else {
+            format!("自审不合格：{}", self.fail())
+        }
+    }
+}
+
+/// 重跑决策（纯函数，可单测）：通过 → 收货；取消 → 收货；
+/// 超过轮数上限 → 收货但播报警告；否则 → 重跑。
+fn retry_decision(ok: bool, attempt: u32, cancelled: bool) -> u8 {
+    if cancelled || ok {
+        0 // Accept
+    } else if attempt >= AUDIT_MAX_RETRY {
+        2 // CapWarn
+    } else {
+        1 // Rerun
+    }
+}
+
+/// PNG IHDR 里的宽高（生成图永远是 PNG；读不出来就跳过尺寸校验）
+fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 24 || bytes[0..8] != [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A] {
+        return None;
+    }
+    let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let h = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    Some((w, h))
+}
+
+/// 从 ffmpeg 输出文本里取最后一次出现的 YAVG（signalstats 平均亮度，0-255）
+fn parse_yavg(text: &str) -> Option<f64> {
+    let mut yavg = None;
+    for part in text.split("YAVG=") {
+        let num: String = part
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+            .collect();
+        if let Ok(v) = num.parse::<f64>() {
+            yavg = Some(v);
+        }
+    }
+    yavg
+}
+
+/// 用 signalstats 算一帧的平均亮度。seek: None=首帧，Some(t)=定位到 t 秒。
+fn frame_brightness(ffmpeg: &Path, src: &str, seek: Option<&str>) -> Option<f64> {
+    let mut args: Vec<&str> = vec!["-y", "-hide_banner"];
+    if let Some(t) = seek {
+        args.push("-ss");
+        args.push(t);
+    }
+    args.extend([
+        "-i", src, "-frames:v", "1",
+        "-vf", "signalstats,metadata=print:key=lavfi.signalstats.YAVG",
+        "-f", "null", "-",
+    ]);
+    let mut cmd = std::process::Command::new(ffmpeg);
+    cmd.args(&args);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let out = cmd.output().ok()?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    parse_yavg(&text)
+}
+
+/// 视频流信息：宽 / 高 / fps / 是否有音轨
+fn ffprobe_streams(ffprobe: &Path, file: &Path) -> Option<(Option<u32>, Option<u32>, Option<f64>, bool)> {
+    let mut cmd = std::process::Command::new(ffprobe);
+    cmd.args([
+        "-v", "error", "-show_entries", "stream=codec_type,width,height,avg_frame_rate",
+        "-of", "json",
+        file.to_str()?,
+    ]);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).ok()?;
+    let streams = v.get("streams")?.as_array()?;
+    let (mut w, mut h, mut fps, mut audio) = (None, None, None, false);
+    for s in streams {
+        match s.get("codec_type").and_then(|x| x.as_str()).unwrap_or("") {
+            "video" => {
+                w = s.get("width").and_then(|x| x.as_u64()).map(|x| x as u32).or(w);
+                h = s.get("height").and_then(|x| x.as_u64()).map(|x| x as u32).or(h);
+                if fps.is_none() {
+                    if let Some(r) = s.get("avg_frame_rate").and_then(|x| x.as_str()) {
+                        let mut it = r.split('/');
+                        let a: f64 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0.0);
+                        let b: f64 = it.next().and_then(|x| x.parse().ok()).unwrap_or(1.0);
+                        if a > 0.0 && b > 0.0 {
+                            fps = Some(a / b);
+                        }
+                    }
+                }
+            }
+            "audio" => audio = true,
+            _ => {}
+        }
+    }
+    Some((w, h, fps, audio))
+}
+
+/// 图片自审：全黑/全白判废（亮度采样）+ 尺寸 vs size 参数
+fn audit_image(ffmpeg: &Path, tmp_dir: &Path, img: &ImageVal, size_param: &str) -> Audit {
+    let mut failed = Vec::new();
+    let mut notes = Vec::new();
+    let mut details = json!({ "bytes": img.bytes.len() });
+    let tmp = tmp_dir.join(format!("audit_{}.png", new_prompt_id()));
+    let _ = std::fs::create_dir_all(tmp_dir);
+    if std::fs::write(&tmp, &img.bytes).is_err() {
+        return Audit::pass(vec!["自检临时文件写失败，跳过质检".into()], details);
+    }
+    let bright = frame_brightness(ffmpeg, tmp.to_str().unwrap_or(""), None);
+    let _ = std::fs::remove_file(&tmp);
+    details["brightness"] = json!(bright);
+    match bright {
+        Some(b) if b < DARK_LIMIT => failed.push(format!("画面全黑（平均亮度 {b:.1}/255）")),
+        Some(b) if b > BRIGHT_LIMIT => failed.push(format!("画面全白（平均亮度 {b:.1}/255）")),
+        Some(b) => notes.push(format!("亮度 {b:.0}/255")),
+        None => notes.push("亮度检测失败，已跳过".into()),
+    }
+    if let Some((w, h)) = png_size(&img.bytes) {
+        details["width"] = json!(w);
+        details["height"] = json!(h);
+        let expect: Vec<u32> = size_param
+            .split(['x', 'X', '*'])
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        if expect.len() == 2 && (expect[0] != w || expect[1] != h) {
+            failed.push(format!("尺寸 {w}x{h} 与参数 {size_param} 不符"));
+        } else if expect.len() == 2 {
+            notes.push(format!("尺寸 {w}x{h} ✓"));
+        }
+    } else {
+        notes.push("无法读取图片尺寸，已跳过尺寸校验".into());
+    }
+    Audit { ok: failed.is_empty(), failed, notes, details }
+}
+
+/// 视频自审：实测时长 vs 计划（±1.5s）+ 分辨率短边 + 音轨 + 首/中/尾三帧亮度判全黑全白
+fn audit_video(
+    ffmpeg: &Path,
+    ffprobe: &Path,
+    path: &Path,
+    planned: Option<i64>,
+    generate_audio: bool,
+    resolution: &str,
+) -> Audit {
+    let mut failed = Vec::new();
+    let mut notes = Vec::new();
+    if !path.exists() {
+        return Audit { ok: false, failed: vec!["视频文件不存在".into()], notes, details: json!({}) };
+    }
+    let src = path.to_str().unwrap_or("");
+    let mut details = json!({ "planned_duration": planned, "generate_audio": generate_audio });
+    if let Ok(meta) = std::fs::metadata(path) {
+        details["file_size"] = json!(meta.len());
+    }
+
+    // 时长
+    let dur = ffprobe_duration(ffprobe, path);
+    match dur {
+        Some(d) => {
+            details["duration"] = json!(d);
+            if let Some(p) = planned.filter(|p| *p > 0) {
+                let diff = (d - p as f64).abs();
+                if diff > DURATION_TOLERANCE {
+                    failed.push(format!("实测时长 {d:.1}s 与计划 {p}s 偏差 {diff:.1}s（>{DURATION_TOLERANCE}s）"));
+                } else {
+                    notes.push(format!("时长 {d:.1}s ✓"));
+                }
+            } else {
+                notes.push(format!("时长 {d:.1}s（未设计划时长，不比对）"));
+            }
+        }
+        None => failed.push("ffprobe 读不到时长，文件可能损坏".into()),
+    }
+
+    // 流信息：分辨率 / fps / 音轨
+    match ffprobe_streams(ffprobe, path) {
+        Some((w, h, fps, audio)) => {
+            details["width"] = json!(w);
+            details["height"] = json!(h);
+            details["fps"] = json!(fps);
+            details["has_audio"] = json!(audio);
+            if generate_audio && !audio {
+                failed.push("要求生成音频，但没有音轨".into());
+            }
+            if audio {
+                notes.push("音轨 ✓".to_string());
+            }
+            let expected_short = match resolution.trim() {
+                "480p" => 480.0,
+                "720p" => 720.0,
+                "1080p" => 1080.0,
+                _ => 0.0,
+            };
+            if expected_short > 0.0 {
+                if let (Some(w), Some(h)) = (w, h) {
+                    let short = w.min(h) as f64;
+                    if short < expected_short * RESOLUTION_TOLERANCE {
+                        failed.push(format!(
+                            "分辨率 {w}x{h} 达不到 {resolution}（短边 {short:.0} < {}）",
+                            (expected_short * RESOLUTION_TOLERANCE) as u32
+                        ));
+                    } else {
+                        notes.push(format!("分辨率 {w}x{h} ✓"));
+                    }
+                }
+            }
+        }
+        None => failed.push("ffprobe 读不到流信息，文件可能损坏".into()),
+    }
+
+    // 首 / 中 / 尾三帧亮度采样，全黑全白判废
+    if let Some(d) = dur.filter(|d| *d > 0.0) {
+        let mut samples: Vec<Option<f64>> = vec![frame_brightness(ffmpeg, src, None)];
+        samples.push(frame_brightness(ffmpeg, src, Some(&format!("{:.2}", d * 0.5))));
+        samples.push(frame_brightness(ffmpeg, src, Some(&format!("{:.2}", (d - 0.6).max(0.0)))));
+        let got: Vec<f64> = samples.iter().filter_map(|b| *b).collect();
+        details["brightness_samples"] = json!(samples);
+        if got.len() >= 2 {
+            if got.iter().all(|b| *b < DARK_LIMIT) {
+                failed.push(format!("画面全黑（{} 帧采样亮度均 <{DARK_LIMIT:.0}/255）", got.len()));
+            } else if got.iter().all(|b| *b > BRIGHT_LIMIT) {
+                failed.push(format!("画面全白（{} 帧采样亮度均 >{BRIGHT_LIMIT:.0}/255）", got.len()));
+            } else {
+                let disp: Vec<String> = got.iter().map(|b| format!("{b:.0}")).collect();
+                notes.push(format!("亮度采样 {}/255", disp.join("/")));
+            }
+        } else {
+            notes.push("亮度采样不足，已跳过全黑全白判定".into());
+        }
+    }
+
+    Audit { ok: failed.is_empty(), failed, notes, details }
+}
+
+/// 对一个生成节点的产物做自审（按节点类型分发）
+fn audit_node_outputs(
+    ffmpeg: &Path,
+    ffprobe: &Path,
+    tmp_dir: &Path,
+    def: &NodeDef,
+    outs: &[NodeVal],
+) -> Audit {
+    match def.class_type.as_str() {
+        "DramaCharacter" | "DramaShotFrame" | "StoryForgeSeedream" => {
+            let size = def.inputs.get("size").and_then(|v| v.as_str()).unwrap_or("");
+            for v in outs {
+                if let NodeVal::Image(i) = v {
+                    return audit_image(ffmpeg, tmp_dir, i, size);
+                }
+            }
+            Audit::pass(vec!["没有图片产物，跳过质检".into()], json!({}))
+        }
+        "DramaShotVideo" | "StoryForgeSeedance" => {
+            let planned = def.inputs.get("duration").and_then(|v| v.as_i64());
+            let gen_audio = def.inputs.get("generate_audio").and_then(|v| v.as_bool()).unwrap_or(false);
+            let res = def.inputs.get("resolution").and_then(|v| v.as_str()).unwrap_or("720p");
+            for v in outs {
+                if let NodeVal::Video(vid) = v {
+                    return audit_video(ffmpeg, ffprobe, &vid.path, planned, gen_audio, res);
+                }
+            }
+            Audit::pass(vec!["没有视频产物，跳过质检".into()], json!({}))
+        }
+        _ => Audit::pass(vec![], json!({})),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1294,7 +1641,7 @@ pub fn kernel_submit(
             for nid in &order {
                 ctx.check_cancel()?;
                 ctx.emit_node("executing", nid);
-                let outs = execute_node(&ctx, nid, &nodes, &mut produced, &mut assets_counter)
+                let mut outs = execute_node(&ctx, nid, &nodes, &mut produced, &mut assets_counter)
                     .await
                     .map_err(|e| {
                         if e == "__cancelled__" {
@@ -1303,6 +1650,57 @@ pub fn kernel_submit(
                             format!("节点 {nid} 执行失败：{e}")
                         }
                     })?;
+                // P0-1 自审：生成节点产物质检，不合格自动重跑该镜（复用单节点重跑，
+                // 上游角色图不重新生成；最多 2 轮，之后 pass with warnings 不烧钱）
+                if let Some(def) = nodes.get(nid) {
+                    if AUDIT_GEN_NODES.contains(&def.class_type.as_str()) {
+                        let mut attempt: u32 = 0;
+                        loop {
+                            let audit = audit_node_outputs(
+                                &ctx.ffmpeg,
+                                &ctx.ffprobe,
+                                &ctx.tmp_dir,
+                                def,
+                                &outs,
+                            );
+                            ctx.record_verification(nid, &audit, attempt);
+                            ctx.emit(json!({ "type": "progress", "node": nid, "detail": audit.summary() }));
+                            match retry_decision(audit.ok, attempt, ctx.run.cancelled()) {
+                                0 => break, // 通过 / 已取消
+                                2 => {
+                                    // 重试上限：按原样保留并明说
+                                    ctx.emit(json!({
+                                        "type": "progress", "node": nid,
+                                        "detail": format!(
+                                            "自审不合格已达重试上限（{AUDIT_MAX_RETRY} 轮），按原样保留：{}",
+                                            audit.fail()
+                                        ),
+                                    }));
+                                    break;
+                                }
+                                _ => {
+                                    attempt += 1;
+                                    ctx.emit(json!({
+                                        "type": "progress", "node": nid,
+                                        "detail": format!(
+                                            "自审不合格（{}），自动重跑（第 {attempt}/{AUDIT_MAX_RETRY} 轮）",
+                                            audit.fail()
+                                        ),
+                                    }));
+                                    outs = execute_node(&ctx, nid, &nodes, &mut produced, &mut assets_counter)
+                                        .await
+                                        .map_err(|e| {
+                                            if e == "__cancelled__" {
+                                                "已取消".to_string()
+                                            } else {
+                                                format!("节点 {nid} 重跑失败：{e}")
+                                            }
+                                        })?;
+                                }
+                            }
+                        }
+                    }
+                }
                 produced.insert(nid.clone(), outs);
                 ctx.emit_node("executed", nid);
             }
@@ -1395,4 +1793,141 @@ pub fn find_tool(candidates: &[PathBuf], root: &Path, name: &str) -> Option<Path
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// 自审单测：黑屏视频 / 全白图必须判废，正常内容必须放行
+//（依赖随包的 ffmpeg/ffprobe，只在本机构建时跑）
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, windows))]
+mod audit_tests {
+    use super::*;
+
+    struct Tools {
+        ffmpeg: PathBuf,
+        ffprobe: PathBuf,
+        tmp: PathBuf,
+    }
+
+    impl Tools {
+        fn new() -> Self {
+            static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            // 每个测试实例独立子目录：cargo test 并行跑，共用目录会被别人的 Drop 清掉
+            let tmp = manifest.join("..").join("..").join(format!(".test-audit-tmp-{n}"));
+            let _ = std::fs::create_dir_all(&tmp);
+            Self {
+                ffmpeg: manifest.join("..").join("bin").join("ffmpeg.exe"),
+                ffprobe: manifest.join("..").join("bin").join("ffprobe.exe"),
+                tmp,
+            }
+        }
+        /// 用 lavfi 造测试素材（确定性输出，不花一分钱）
+        fn make(&self, lavfi: &[&str], out: &str) -> PathBuf {
+            let path = self.tmp.join(out);
+            let mut args: Vec<&str> = vec!["-y"];
+            args.extend_from_slice(lavfi);
+            args.push(path.to_str().unwrap());
+            run_ffmpeg(&self.ffmpeg, &args).expect("造测试素材失败");
+            path
+        }
+    }
+
+    impl Drop for Tools {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.tmp);
+        }
+    }
+
+    #[test]
+    fn black_video_is_rejected() {
+        let t = Tools::new();
+        let v = t.make(
+            &["-f", "lavfi", "-i", "color=c=black:s=320x568:d=3", "-r", "24"],
+            "black.mp4",
+        );
+        let a = audit_video(&t.ffmpeg, &t.ffprobe, &v, Some(5), false, "720p");
+        assert!(!a.ok, "黑屏视频必须判废");
+        assert!(a.failed.iter().any(|f| f.contains("全黑")), "应有全黑判定：{:?}", a.failed);
+        assert!(
+            a.failed.iter().any(|f| f.contains("时长")),
+            "应有时长偏差判定（3s vs 计划 5s）：{:?}",
+            a.failed
+        );
+    }
+
+    #[test]
+    fn white_image_is_rejected() {
+        let t = Tools::new();
+        let img_bytes = std::fs::read(t.make(
+            &["-f", "lavfi", "-i", "color=c=white:s=100x100", "-frames:v", "1"],
+            "white.png",
+        ))
+        .unwrap();
+        let img = ImageVal { bytes: img_bytes, mime: "image/png".into(), source_url: String::new() };
+        let a = audit_image(&t.ffmpeg, &t.tmp, &img, "1080x1920");
+        assert!(!a.ok, "全白图必须判废");
+        assert!(a.failed.iter().any(|f| f.contains("全白")), "{:?}", a.failed);
+        assert!(
+            a.failed.iter().any(|f| f.contains("尺寸")),
+            "尺寸 100x100 vs 1080x1920 应判不符：{:?}",
+            a.failed
+        );
+    }
+
+    #[test]
+    fn normal_artifacts_pass() {
+        let t = Tools::new();
+        // 灰色 1080x1920 图，尺寸与参数一致 → 放行
+        let img_bytes = std::fs::read(t.make(
+            &["-f", "lavfi", "-i", "color=c=0x808080:s=1080x1920", "-frames:v", "1"],
+            "gray.png",
+        ))
+        .unwrap();
+        assert_eq!(png_size(&img_bytes), Some((1080, 1920)), "PNG 尺寸解析");
+        let img = ImageVal { bytes: img_bytes, mime: "image/png".into(), source_url: String::new() };
+        let a = audit_image(&t.ffmpeg, &t.tmp, &img, "1080x1920");
+        assert!(a.ok, "正常灰图应放行：{:?}", a.failed);
+
+        // 中灰视频 + 时长对 + 分辨率对 → 放行（无音轨但没要求音频）
+        let v = t.make(
+            &["-f", "lavfi", "-i", "color=c=0x808080:s=720x1280:d=5", "-r", "24"],
+            "gray.mp4",
+        );
+        let a = audit_video(&t.ffmpeg, &t.ffprobe, &v, Some(5), false, "720p");
+        assert!(a.ok, "正常灰视频应放行：{:?}", a.failed);
+    }
+
+    #[test]
+    fn missing_audio_and_low_resolution_are_rejected() {
+        let t = Tools::new();
+        // 无音轨 + 要求生成音频 → 判废；分辨率 320x180 远低于 720p → 判废
+        let v = t.make(
+            &["-f", "lavfi", "-i", "color=c=0x808080:s=320x180:d=5", "-r", "24"],
+            "small.mp4",
+        );
+        let a = audit_video(&t.ffmpeg, &t.ffprobe, &v, Some(5), true, "720p");
+        assert!(!a.ok);
+        assert!(a.failed.iter().any(|f| f.contains("音轨")), "{:?}", a.failed);
+        assert!(a.failed.iter().any(|f| f.contains("分辨率")), "{:?}", a.failed);
+    }
+
+    #[test]
+    fn retry_decision_rules() {
+        // 通过 / 取消 → 收货；连续失败（attempt 0,1,2）→ 2 轮后收货+警告
+        assert_eq!(retry_decision(true, 0, false), 0);
+        assert_eq!(retry_decision(false, 0, true), 0);
+        assert_eq!(retry_decision(false, 0, false), 1);
+        assert_eq!(retry_decision(false, 1, false), 1);
+        assert_eq!(retry_decision(false, 2, false), 2, "第 3 次失败必须止损");
+    }
+
+    #[test]
+    fn yavg_parse() {
+        assert_eq!(parse_yavg("frame:0 pts:0\nlavfi.signalstats.YAVG=57.375000"), Some(57.375));
+        assert_eq!(parse_yavg("no data here"), None);
+        assert_eq!(parse_yavg("YAVG=0.0 later YAVG=12.5"), Some(12.5), "取最后一次");
+    }
 }
