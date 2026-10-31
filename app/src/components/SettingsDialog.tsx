@@ -6,7 +6,7 @@ import { LIB_STATS, LIB_VERSION, MISSING_CORE, REFERENCE_NODES } from "../lib/no
 import { Btn, I, IconBtn, Spinner, Tag } from "./ui";
 
 export function SettingsDialog({ onClose }: { onClose: () => void }) {
-  const { config, env, saveConfig, clearLearnings, addLearning, removeLearning, idleStopMin, setIdleStopMin, setProjectsRoot } =
+  const { config, env, saveConfig, clearLearnings, addLearning, removeLearning, setProjectsRoot } =
     useStore();
   const [baseUrl, setBaseUrl] = useState("");
   const [apiKey, setApiKey] = useState("");
@@ -18,7 +18,6 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const [genAudio, setGenAudio] = useState(true);
   const [maxShots, setMaxShots] = useState("3");
   const [maxSeconds, setMaxSeconds] = useState("30");
-  const [port, setPort] = useState("8188");
   const [root, setRoot] = useState("");
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -37,13 +36,11 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
     setGenAudio(config.video?.generateAudio !== false);
     setMaxShots(String(config.budget?.maxShots ?? 3));
     setMaxSeconds(String(config.budget?.maxSeconds ?? 30));
-    setPort(String(config.comfyPort || 8188));
   }, [config]);
 
   const buildPatch = () =>
     ({
       projectRoot: root.trim(),
-      comfyPort: Number(port) || 8188,
       llm: { baseUrl, apiKey, model },
       ark: { apiKey: arkKey },
       image: { model: imageModel },
@@ -180,7 +177,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
             ) : null}
           </Section>
 
-          <Section title="生成模型" hint="ARK 节点，改后需重启 ComfyUI">
+          <Section title="生成模型" hint="ARK 直连，改完保存即生效">
             <Field label="ARK Key" hint={env?.arkKeySet ? "已配置" : "未配置"}>
               <input
                 type="password"
@@ -256,15 +253,8 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
             </p>
           </Section>
 
-          <Section title="ComfyUI">
+          <Section title="执行内核" hint="常驻，无需启动">
             <div className="grid grid-cols-[120px_1fr] gap-3">
-              <Field label="端口">
-                <input
-                  value={port}
-                  onChange={(e) => setPort(e.target.value)}
-                  className="field font-mono tabular"
-                />
-              </Field>
               <Field label="项目根目录" hint="留空自动识别">
                 <input
                   value={root}
@@ -274,35 +264,25 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                 />
               </Field>
             </div>
-            <div className="grid grid-cols-[120px_1fr] items-start gap-3">
-              <Field label="空闲自动停" hint="省显存">
-                <select
-                  value={idleStopMin}
-                  onChange={(e) => setIdleStopMin(Number(e.target.value))}
-                  className="field"
-                >
-                  <option value={0}>不自动停</option>
-                  <option value={2}>2 分钟</option>
-                  <option value={5}>5 分钟 · 默认</option>
-                  <option value={10}>10 分钟</option>
-                  <option value={30}>30 分钟</option>
-                </select>
-              </Field>
-              <p className="t-11 leading-[17px] text-[var(--fg-4)]">
-                生成算力在云端 ARK，ComfyUI 本地只负责派发和收文件。引擎开着会一直占内存 / 显存，
-                停多久都没产出就该让它停；下次点「开始生成」会自己拉起来，已有素材不受影响。
-              </p>
-            </div>
+            <p className="t-11 leading-[17px] text-[var(--fg-4)]">
+              生成算力在云端 ARK；本地内核只做图的派发、收文件和像素杂活（占位图 / 缩放 / 抽帧 / 拼接），
+              不占显存、没有启动等待。停用旧的「空闲自动停」已随 ComfyUI 一起退役。
+            </p>
             <div className="space-y-1 rounded-[10px] bg-[var(--bg-2)] p-3 t-11 font-mono leading-[17px] text-[var(--fg-4)]">
               <Path label="配置" value={env?.configPath} />
               <Path label="根目录" value={env?.projectRoot} />
-              <Path label="内核" value={env?.comfyDir} />
               <Path label="工作区" value={env?.comfyBase} />
-              <Path label="Python" value={env?.venvPython} />
+              <Path label="提示词" value={`${env?.projectRoot || ""}\\engine\\prompts`} />
+              <div className="flex gap-2">
+                <span className="w-12 shrink-0 text-[var(--fg-3)]">ffmpeg</span>
+                <span className={env?.ffmpegReady ? "text-[var(--ok)]" : "text-[var(--err)]"}>
+                  {env?.ffmpegReady ? "已就绪" : "缺失（拼接/抽帧不可用）"}
+                </span>
+              </div>
               <div className="flex gap-2">
                 <span className="w-12 shrink-0 text-[var(--fg-3)]">节点</span>
                 <span className={env?.nodesInstalled ? "text-[var(--ok)]" : "text-[var(--err)]"}>
-                  {env?.nodesInstalled ? "已安装" : "缺失"}
+                  {env?.nodesInstalled ? "已就绪" : "缺失"}
                 </span>
               </div>
             </div>
@@ -379,7 +359,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
             ) : null}
           </Section>
 
-          <Section title="节点库" hint={`ComfyUI ${LIB_VERSION}`}>
+          <Section title="节点库" hint={`内核 ${LIB_VERSION}`}>
             <div className="grid grid-cols-3 gap-2">
               <Stat label="可直接用" value={LIB_STATS.usable} tone="good" />
               <Stat label="需模型权重" value={LIB_STATS.needWeights} />
@@ -387,8 +367,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
             </div>
             <p className="t-11 leading-[17px] text-[var(--fg-4)]">
               计划模式只把分镜语法与角色锚点交给对话模型，节点图由编译器生成，再按{" "}
-              {LIB_STATS.usable} 个可执行节点校验连线与类型；需权重的节点会被拦下，
-              {REFERENCE_NODES.length} 个第三方节点的参数设计留作扩展参考。
+              {LIB_STATS.usable} 个内核节点校验连线与类型；目录外的节点会在提交时被内核拒收。
             </p>
             {MISSING_CORE.length ? (
               <div className="flex items-center gap-2">

@@ -32,18 +32,20 @@ export interface ChatMessage {
 export interface EnvReport {
   configPath: string;
   projectRoot: string;
+  /** 工作区目录（原 ComfyUI base，产物仍在它的 output/ 下） */
   comfyDir: string;
   comfyBase: string;
   comfyDirExists: boolean;
   comfyBaseExists: boolean;
+  /** 提示词资产（engine/prompts）是否就绪 */
   nodesInstalled: boolean;
-  venvPython: string;
-  venvExists: boolean;
-  torchInstalled: boolean;
+  /** ffmpeg + ffprobe 是否可用（拼接成片 / 尾帧接续 / 占位图） */
+  ffmpegReady: boolean;
   llmKeySet: boolean;
   arkKeySet: boolean;
   llmModel: string;
   llmBaseUrl: string;
+  /** 兼容保留：内核时代无端口概念，恒为 0 */
   comfyPort: number;
 }
 

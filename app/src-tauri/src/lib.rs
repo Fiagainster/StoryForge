@@ -1,17 +1,13 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use tauri::{Manager, State};
+use tauri::Manager;
 
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+mod kernel;
 
 /// 正在跑的模型流：stream_id → 中断旗标。
 /// 前端点「停止」时立旗，读流的循环下一块就撒手——不然一轮对话跑飞了只能等它说完。
@@ -38,11 +34,6 @@ fn llm_abort(stream_id: Option<String>) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-#[derive(Default)]
-struct AppState {
-    comfy: Mutex<Option<Child>>,
 }
 
 fn default_config() -> Value {
@@ -167,8 +158,10 @@ fn load_config(app: &tauri::AppHandle) -> Value {
     fallback
 }
 
+/// 产品根标记：engine/ 下有 workspace 或 prompts 任一即认定（换内核后不再有 ComfyUI）
 fn is_product_root(path: &Path) -> bool {
-    path.join("engine").join("ComfyUI").join("main.py").is_file()
+    let engine = path.join("engine");
+    engine.join("workspace").is_dir() || engine.join("prompts").is_dir()
 }
 
 fn walk_to_root(start: &Path) -> Option<PathBuf> {
@@ -243,27 +236,43 @@ fn set_config(app: tauri::AppHandle, patch: Value) -> Value {
     merged
 }
 
+/// ffmpeg / ffprobe 的候选目录：exe 同目录、exe/bin、打包资源目录
+fn tool_candidates(app: &tauri::AppHandle) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent() {
+            dirs.push(d.to_path_buf());
+            dirs.push(d.join("bin"));
+        }
+    }
+    if let Ok(rd) = app.path().resource_dir() {
+        dirs.push(rd.clone());
+        dirs.push(rd.join("bin"));
+    }
+    dirs
+}
+
 #[tauri::command]
 fn env_check(app: tauri::AppHandle) -> Value {
     let cfg = load_config(&app);
     let root = detect_root(&cfg);
-    let comfy_dir = resolve(&cfg, &root, "comfyDir");
-    let base_dir = resolve(&cfg, &root, "comfyBase");
-    let py = resolve(&cfg, &root, "venvPython");
-    let venv_root = py.parent().and_then(|p| p.parent()).map(|p| p.to_path_buf());
-    let torch_dir = venv_root.map(|v| v.join("Lib").join("site-packages").join("torch"));
+    let workspace = resolve(&cfg, &root, "comfyBase");
+    let prompts = root.join("engine").join("prompts");
+    let ffmpeg = kernel::find_tool(&tool_candidates(&app), &root, "ffmpeg");
+    let ffprobe = kernel::find_tool(&tool_candidates(&app), &root, "ffprobe");
 
     json!({
         "configPath": config_path(&app).map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
         "projectRoot": root.to_string_lossy(),
-        "comfyDir": comfy_dir.to_string_lossy(),
-        "comfyBase": base_dir.to_string_lossy(),
-        "comfyDirExists": comfy_dir.join("main.py").exists(),
-        "comfyBaseExists": base_dir.is_dir(),
-        "nodesInstalled": base_dir.join("custom_nodes").join("storyforge_ark").join("nodes.py").exists(),
-        "venvPython": py.to_string_lossy(),
-        "venvExists": py.exists(),
-        "torchInstalled": torch_dir.map(|p| p.exists()).unwrap_or(false),
+        "comfyDir": workspace.to_string_lossy(),
+        "comfyBase": workspace.to_string_lossy(),
+        "comfyDirExists": workspace.is_dir(),
+        "comfyBaseExists": workspace.is_dir(),
+        "nodesInstalled": prompts.join("style-bible.json").is_file(),
+        "venvPython": "",
+        "venvExists": ffmpeg.is_some(),
+        "ffmpegReady": ffmpeg.is_some() && ffprobe.is_some(),
+        "torchInstalled": false,
         "llmKeySet": cfg["llm"]["apiKey"].as_str().map(|s| !s.trim().is_empty()).unwrap_or(false),
         "arkKeySet": cfg["ark"]["apiKey"].as_str().map(|s| !s.trim().is_empty()).unwrap_or(false),
         "llmModel": cfg["llm"]["model"],
@@ -272,118 +281,25 @@ fn env_check(app: tauri::AppHandle) -> Value {
     })
 }
 
+/// 内核常驻：原生执行器没有进程要拉，永远就绪。
+/// comfyStatus 保留给前端的状态灯：running 恒真，端口字段只为兼容旧界面。
 #[tauri::command]
-async fn comfy_status(app: tauri::AppHandle) -> Value {
-    let cfg = load_config(&app);
-    let port = cfg["comfyPort"].as_u64().unwrap_or(8188);
-    let url = format!("http://127.0.0.1:{port}/system_stats");
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(1500))
-        .build()
-        .unwrap_or_default();
-    match client.get(&url).send().await {
-        Ok(r) if r.status().is_success() => {
-            let stats: Value = r.json().await.unwrap_or(json!({}));
-            json!({ "running": true, "port": port, "stats": stats })
-        }
-        _ => json!({ "running": false, "port": port }),
-    }
+async fn comfy_status() -> Value {
+    json!({ "running": true, "port": 0, "native": true })
 }
 
+/// 兼容旧调用点：内核无需启动，立即就绪
 #[tauri::command]
-fn comfy_start(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<Value, String> {
-    let cfg = load_config(&app);
-    let root = detect_root(&cfg);
-    let comfy_dir = resolve(&cfg, &root, "comfyDir");
-    let base_dir = resolve(&cfg, &root, "comfyBase");
-    let py = resolve(&cfg, &root, "venvPython");
-    let port = cfg["comfyPort"].as_u64().unwrap_or(8188);
-
-    if !py.exists() {
-        return Err(format!(
-            "找不到 ComfyUI 的 Python 环境：{}\n请检查 app/engine/venv 是否完整，或在设置里修正项目根目录。",
-            py.display()
-        ));
-    }
-    if !comfy_dir.join("main.py").exists() {
-        return Err(format!("找不到 ComfyUI 目录：{}", comfy_dir.display()));
-    }
-
-    let mut guard = state.comfy.lock().map_err(|e| e.to_string())?;
-    if let Some(child) = guard.as_mut() {
-        if child.try_wait().map(|s| s.is_none()).unwrap_or(false) {
-            return Ok(json!({ "ok": true, "already": true, "pid": child.id() }));
-        }
-    }
-
-    for sub in ["input", "output", "temp", "user"] {
-        std::fs::create_dir_all(base_dir.join(sub)).map_err(|e| e.to_string())?;
-    }
-    let log_path = base_dir.join("user").join("storyforge-comfy.log");
-    let out = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
-    let err = out.try_clone().map_err(|e| e.to_string())?;
-
-    let mut cmd = Command::new(&py);
-    cmd.arg("-s")
-        .arg("main.py")
-        .arg("--base-directory")
-        .arg(&base_dir)
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("--cpu")
-        .arg("--preview-method")
-        .arg("none")
-        .arg("--enable-cors-header")
-        .arg("*")
-        .current_dir(&comfy_dir)
-        .stdout(Stdio::from(out))
-        .stderr(Stdio::from(err))
-        .env("PYTHONIOENCODING", "utf-8");
-
-    // 节点只用 ARK Key；旧配置把 ARK Key 填在 llm.apiKey 的也兼容
-    let ark_key = cfg["ark"]["apiKey"]
-        .as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            let k = cfg["llm"]["apiKey"].as_str().unwrap_or("").trim();
-            if k.starts_with("ark-") {
-                Some(k)
-            } else {
-                None
-            }
-        });
-    if let Some(key) = ark_key {
-        cmd.env("ARK_API_KEY", key);
-    }
-
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-
-    let child = cmd.spawn().map_err(|e| format!("启动 ComfyUI 失败：{e}"))?;
-    let pid = child.id();
-    *guard = Some(child);
-
-    Ok(json!({
-        "ok": true,
-        "pid": pid,
-        "port": port,
-        "base": base_dir.to_string_lossy(),
-        "log": log_path.to_string_lossy()
-    }))
+fn comfy_start() -> Result<Value, String> {
+    Ok(json!({ "ok": true, "native": true }))
 }
 
+/// 前端的「停止」= 掐掉当前在跑的执行
 #[tauri::command]
-fn comfy_stop(state: State<'_, AppState>) -> Result<Value, String> {
-    let mut guard = state.comfy.lock().map_err(|e| e.to_string())?;
-    if let Some(mut child) = guard.take() {
-        let _ = child.kill();
-        let _ = child.wait();
-        Ok(json!({ "ok": true, "stopped": true }))
-    } else {
-        Ok(json!({ "ok": true, "stopped": false }))
-    }
+fn comfy_stop() -> Result<Value, String> {
+    kernel::kernel_interrupt()
 }
+
 
 /// 产物的真身就在磁盘上（--base-directory 下的 output/）。
 /// 把绝对路径交给前端，历史里的图/视频就不必依赖 ComfyUI 还开着才能看：
@@ -1055,14 +971,9 @@ fn assemble_shots(
 ) -> Result<Value, String> {
     let cfg = load_config(&app);
     let root = detect_root(&cfg);
-    let py = resolve(&cfg, &root, "venvPython");
-    if !py.exists() {
-        return Err("找不到 Python 环境".into());
-    }
-    let script = root.join("engine").join("assemble.py");
-    if !script.exists() {
-        return Err("找不到 engine/assemble.py".into());
-    }
+    let ffmpeg = kernel::find_tool(&tool_candidates(&app), &root, "ffmpeg")
+        .ok_or("找不到 ffmpeg（拼接成片需要它）。请把 ffmpeg.exe 放进项目根的 bin/ 文件夹，或重新安装完整版。")?;
+    let ffprobe = kernel::find_tool(&tool_candidates(&app), &root, "ffprobe");
 
     let base_dir = resolve(&cfg, &root, "comfyBase");
     let mut paths: Vec<PathBuf> = Vec::new();
@@ -1099,46 +1010,60 @@ fn assemble_shots(
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let out_name = format!("film_{}_{}.mp4", safe, ts);
-    let out_path = base_dir
+    let out_dir = base_dir
         .join("output")
         .join("storyforge")
-        .join("film")
-        .join(&out_name);
+        .join("film");
+    std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+    let out_path = out_dir.join(&out_name);
 
-    let mut cmd = Command::new(&py);
-    cmd.arg("-s").arg(&script).arg("--out").arg(&out_path);
-    for p in &paths {
-        cmd.arg(p);
-    }
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    cmd.env("PYTHONIOENCODING", "utf-8");
+    kernel::ffmpeg_concat(&ffmpeg, &paths, &out_path)
+        .map_err(|e| format!("拼接失败：{e}"))?;
 
-    let output = cmd.output().map_err(|e| format!("启动拼接失败：{e}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let last = stdout
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("")
-        .to_string();
-    let v: Value = serde_json::from_str(&last)
-        .map_err(|e| format!("拼接输出解析失败：{e}｜{last}"))?;
-    if v.get("ok").and_then(|x| x.as_bool()) != Some(true) {
-        return Err(
-            v.get("error")
-                .and_then(|x| x.as_str())
-                .unwrap_or("拼接失败")
-                .to_string(),
-        );
-    }
+    let duration = ffprobe.and_then(|p| kernel::probe_duration(&p, &out_path));
 
     Ok(json!({
         "ok": true,
         "runId": run_id,
         "filename": out_name,
         "subfolder": "storyforge/film",
-        "duration": v.get("duration").cloned().unwrap_or(Value::Null),
+        "duration": duration.map(|d| json!(d)).unwrap_or(Value::Null),
     }))
+}
+
+/// 前端提交执行图。内核命令需要的路径与凭证都由这里从配置解析后传入。
+#[tauri::command]
+fn kernel_submit_cmd(
+    app: tauri::AppHandle,
+    graph: Value,
+    client_id: String,
+) -> Result<Value, String> {
+    let cfg = load_config(&app);
+    let root = detect_root(&cfg);
+    let workspace = resolve(&cfg, &root, "comfyBase");
+    let out_dir = workspace.join("output");
+    let prompts_dir = root.join("engine").join("prompts");
+
+    let ark_key = cfg["ark"]["apiKey"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            let k = cfg["llm"]["apiKey"].as_str().unwrap_or("").trim();
+            if k.starts_with("ark-") {
+                Some(k)
+            } else {
+                None
+            }
+        })
+        .unwrap_or("")
+        .to_string();
+
+    let ffmpeg = kernel::find_tool(&tool_candidates(&app), &root, "ffmpeg")
+        .ok_or("找不到 ffmpeg（占位图 / 缩放 / 尾帧都靠它）。请把 ffmpeg.exe 放进项目根的 bin/ 文件夹，或重新安装完整版。")?;
+    let ffprobe = kernel::find_tool(&tool_candidates(&app), &root, "ffprobe").unwrap_or(ffmpeg.clone());
+
+    kernel::kernel_submit(app, graph, client_id, out_dir.to_string_lossy().to_string(), prompts_dir.to_string_lossy().to_string(), ark_key, ffmpeg.to_string_lossy().to_string(), ffprobe.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -1160,7 +1085,6 @@ fn open_in_explorer(path: String) -> Result<(), String> {
 
 pub fn run() {
     tauri::Builder::default()
-        .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             get_config,
             set_config,
@@ -1171,6 +1095,9 @@ pub fn run() {
             comfy_output_dir,
             comfy_output_list,
             comfy_output_trash,
+            kernel_submit_cmd,
+            kernel::kernel_history,
+            kernel::kernel_interrupt,
             llm_chat,
             llm_chat_stream,
             llm_abort,

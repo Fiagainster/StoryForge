@@ -202,7 +202,7 @@ export function auditGraph(graph: ComfyGraph, lookup?: AuditLookup): AuditIssue[
         issues.push({
           level: "warn",
           id,
-          text: `${visibleTitle(graph, id)} 的 "${key}" 是 ${spec.t}，接了一根线，ComfyUI 会忽略这个值`,
+          text: `${visibleTitle(graph, id)} 的 "${key}" 是 ${spec.t}，接了一根线，执行器会忽略这个值`,
         });
         continue;
       }

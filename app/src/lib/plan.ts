@@ -416,7 +416,7 @@ export function buildRepairMessages(
     ? `\n## 已沉淀的经验（务必规避）\n${lessons.map((l) => `- ${l}`).join("\n")}\n`
     : "";
 
-  const system = `你是短剧计划的修复者。这份计划在 ComfyUI / 生成模型执行时失败了，请输出一份修订后的计划。
+  const system = `你是短剧计划的修复者。这份计划在生成模型执行时失败了，请输出一份修订后的计划。
 
 ## 输出（严格 JSON，不要 Markdown，不要解释）
 {"plan": { ...与原计划完全相同的结构... }, "lesson": "一句 30 字以内的经验，说明以后如何避免同类失败"}

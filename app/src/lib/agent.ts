@@ -417,7 +417,7 @@ async function compileAndRun(
   }
   if (!client) {
     return {
-      reply: `${ctx.reply}\n\n（ComfyUI 未启动，计划已生成但未执行）`,
+      reply: `${ctx.reply}\n\n（内核未就绪，计划已生成但未执行）`,
       plan,
       graph: checked,
       degraded: ctx.degraded,
@@ -430,7 +430,7 @@ async function compileAndRun(
   step({
     id: runStepId,
     kind: "tool",
-    title: withVideo ? "执行 ComfyUI · 逐镜出图与视频" : "执行 ComfyUI · 逐镜出图",
+    title: withVideo ? "执行内核 · 逐镜出图与视频" : "执行内核 · 逐镜出图",
     status: "running",
   });
   try {
@@ -438,7 +438,7 @@ async function compileAndRun(
     step({
       id: runStepId,
       kind: "tool",
-      title: withVideo ? "执行 ComfyUI · 逐镜出图与视频" : "执行 ComfyUI · 逐镜出图",
+      title: withVideo ? "执行内核 · 逐镜出图与视频" : "执行内核 · 逐镜出图",
       status: "done",
       note: `${run.assets.length} 个文件 · ${((Date.now() - runAt) / 1000).toFixed(0)}s`,
       detail: `prompt_id ${run.promptId}`,
@@ -456,7 +456,7 @@ async function compileAndRun(
     step({
       id: runStepId,
       kind: "tool",
-      title: withVideo ? "执行 ComfyUI · 逐镜出图与视频" : "执行 ComfyUI · 逐镜出图",
+      title: withVideo ? "执行内核 · 逐镜出图与视频" : "执行内核 · 逐镜出图",
       status: "error",
       note: ((Date.now() - runAt) / 1000).toFixed(0) + "s",
       detail: msg,
@@ -605,7 +605,7 @@ export async function executeEditedGraph(
   }
   if (!client) {
     return {
-      reply: "（ComfyUI 未启动，修改已保存但未执行）",
+      reply: "（内核未就绪，修改已保存但未执行）",
       graph: checked,
     };
   }
@@ -1067,7 +1067,7 @@ export async function runAgentTurn(
     // 但只要配了 Key 就一定走上面的报错分支，不拿占位图糊弄人。
     parsed = {
       reply:
-        "现在还没有接入对话模型，我先用一个本地占位工作流把链路跑通——这张图是 ComfyUI 真实执行出来的，不是假图。配置好模型之后，同一套流程会换成真实生成。",
+        "现在还没有接入对话模型，我先用一个本地占位工作流把链路跑通——这张图是内核真实执行出来的，不是假图。配置好模型之后，同一套流程会换成真实生成。",
       graph: demoGraph(),
     };
   }
@@ -1330,7 +1330,7 @@ export async function runAgentTurn(
 
   if (!client) {
     return done({
-      reply: `${parsed.reply || ""}\n\n（ComfyUI 未启动，工作流已生成但未执行）`,
+      reply: `${parsed.reply || ""}\n\n（内核未就绪，工作流已生成但未执行）`,
       graph,
       degraded,
     });

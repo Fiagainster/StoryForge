@@ -1,13 +1,15 @@
+import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { Asset, ComfyGraph } from "../types";
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export interface HistoryEntry {
   outputs?: Record<string, Record<string, unknown>>;
   status?: { status_str?: string; completed?: boolean; messages?: unknown[] };
+  /** 内核执行失败的原因（对齐 ComfyUI 的 exception_message 位） */
+  error?: string;
 }
 
-/** 执行进度事件：ComfyUI 的 /ws 推什么，这里就翻成什么 */
+/** 执行进度事件：内核的 `kernel://event` 推什么，这里就翻成什么 */
 export interface WatchEvent {
   kind: "start" | "node" | "progress" | "nodeDone" | "cached" | "done" | "error";
   node?: string;
@@ -18,70 +20,64 @@ export interface WatchEvent {
   detail?: string;
 }
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * 原生内核客户端。类名保留 ComfyClient：agent.ts / store.ts 的调用点一行不用改。
+ *
+ * 和旧 ComfyUI 客户端同构：
+ *   queuePrompt  → kernel_submit_cmd（校验 + 后台执行，返回 prompt_id）
+ *   watch        → 订阅 `kernel://event`，消息形状对齐 ComfyUI /ws
+ *   history      → kernel_history，形状对齐 /history/{prompt_id}
+ *   interrupt    → kernel_interrupt（comfy_stop 也走它）
+ */
 export class ComfyClient {
-  constructor(public base: string) {}
+  constructor() {}
 
   async systemStats() {
-    const r = await fetch(`${this.base}/system_stats`);
-    if (!r.ok) throw new Error(`system_stats ${r.status}`);
-    return r.json();
+    return { native: true };
   }
 
   async objectInfo(): Promise<Record<string, unknown>> {
-    const r = await fetch(`${this.base}/object_info`);
-    if (!r.ok) throw new Error(`object_info ${r.status}`);
-    return r.json();
+    return {};
   }
 
   async queuePrompt(graph: ComfyGraph, clientId: string): Promise<string> {
-    const r = await fetch(`${this.base}/prompt`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt: graph, client_id: clientId }),
-    });
-    const text = await r.text();
-    let data: any;
     try {
-      data = JSON.parse(text);
-    } catch {
-      throw new Error(`提交失败：${text.slice(0, 400)}`);
+      const data = await invoke<{ prompt_id: string }>("kernel_submit_cmd", {
+        graph,
+        clientId,
+      });
+      if (!data?.prompt_id) throw new Error("内核未返回 prompt_id");
+      return data.prompt_id;
+    } catch (e) {
+      // 内核拒收（未知节点 / 断线 / 环）——错误文案在 Rust 侧已是人话
+      throw new Error(`内核拒绝执行：${String(e)}`);
     }
-    if (data?.error) {
-      throw new Error(
-        `ComfyUI 拒绝执行：${data.error.message || data.error.type || JSON.stringify(data.error)}`
-      );
-    }
-    if (data?.node_errors && Object.keys(data.node_errors).length > 0) {
-      const detail = Object.entries(data.node_errors)
-        .map(([id, v]: [string, any]) => {
-          const errs = (v?.errors || []).map((e: any) => e?.message).join("; ");
-          return `节点 ${id}(${v?.class_type || "?"}): ${errs}`;
-        })
-        .join("\n");
-      throw new Error(`节点校验失败：\n${detail}`);
-    }
-    if (!data?.prompt_id) throw new Error(`未返回 prompt_id：${text.slice(0, 300)}`);
-    return data.prompt_id as string;
   }
 
   async history(promptId: string): Promise<HistoryEntry | undefined> {
-    const r = await fetch(`${this.base}/history/${promptId}`);
-    if (!r.ok) return undefined;
-    const data = await r.json();
-    return data?.[promptId];
+    try {
+      const data = await invoke<Record<string, HistoryEntry>>("kernel_history", {
+        promptId,
+      });
+      return data?.[promptId];
+    } catch {
+      return undefined;
+    }
   }
 
   async interrupt() {
-    await fetch(`${this.base}/interrupt`, { method: "POST" }).catch(() => {});
+    await invoke("kernel_interrupt").catch(() => {});
   }
 
-  viewUrl(file: { filename: string; subfolder?: string; type?: string }) {
+  /** 产物显示走 mediaSrc 的本地文件协议，这个 URL 只是兜底占位 */
+  viewUrl(file: { filename: string; subfolder?: string }) {
     const q = new URLSearchParams({
       filename: file.filename,
       subfolder: file.subfolder || "",
-      type: file.type || "output",
     });
-    return `${this.base}/view?${q.toString()}`;
+    return `kernel://view?${q.toString()}`;
   }
 
   collectAssets(outputs: Record<string, Record<string, unknown>> | undefined): Asset[] {
@@ -118,52 +114,44 @@ export class ComfyClient {
   }
 
   /**
-   * 订阅一次执行的实时进度。
-   * 之前只能看 `/history` 轮询，生成那几分钟画布是死的；
-   * /ws 会推 executing（开始跑哪个节点）、progress（跑了多少）、executed（哪个节点出结果），
-   * 拿到就能在画布上把"现在跑到哪一步"点亮。
+   * 订阅一次执行的实时进度。内核在 `kernel://event` 上按 clientId 广播，
+   * 消息形状对齐 ComfyUI /ws：executing / progress / executed / execution_*。
    */
   watch(clientId: string, on: (e: WatchEvent) => void): () => void {
-    const wsUrl = `${this.base.replace(/^http/, "ws")}/ws?clientId=${encodeURIComponent(clientId)}`;
-    let ws: WebSocket | null = null;
-    try {
-      ws = new WebSocket(wsUrl);
-    } catch {
-      return () => {};
-    }
-    const handle = (raw: unknown) => {
-      let m: any;
-      try {
-        m = JSON.parse(typeof raw === "string" ? raw : "");
-      } catch {
-        return;
+    let un: UnlistenFn | null = null;
+    let closed = false;
+    listen<{ clientId: string; promptId: string; msg: Record<string, unknown> }>(
+      "kernel://event",
+      (e) => {
+        if (e.payload?.clientId !== clientId) return;
+        handle(e.payload.msg || {});
       }
-      const d = m?.data || {};
-      switch (m?.type) {
+    )
+      .then((u) => {
+        if (closed) u();
+        else un = u;
+      })
+      .catch(() => {});
+
+    const handle = (m: Record<string, unknown>) => {
+      switch (m.type) {
         case "execution_start":
           on({ kind: "start" });
           break;
         case "executing":
-          // data.node 为空 = 这一轮跑完了
-          if (d.node) on({ kind: "node", node: String(d.node) });
+          if (m.node) on({ kind: "node", node: String(m.node) });
           break;
-        case "progress": {
-          const max = Number(d.max) || 0;
-          const value = Number(d.value) || 0;
-          if (d.node) {
+        case "progress":
+          if (m.node) {
             on({
               kind: "progress",
-              node: String(d.node),
-              pct: max > 0 ? Math.min(1, Math.max(0, value / max)) : undefined,
+              node: String(m.node),
+              detail: typeof m.detail === "string" ? m.detail : undefined,
             });
           }
           break;
-        }
         case "executed":
-          if (d.node) on({ kind: "nodeDone", node: String(d.node) });
-          break;
-        case "execution_cached":
-          if (Array.isArray(d.nodes)) on({ kind: "cached", nodes: d.nodes.map(String) });
+          if (m.node) on({ kind: "nodeDone", node: String(m.node) });
           break;
         case "execution_success":
           on({ kind: "done" });
@@ -171,19 +159,17 @@ export class ComfyClient {
         case "execution_error":
           on({
             kind: "error",
-            node: d.node_id ? String(d.node_id) : undefined,
-            detail: String(d.exception_message || "执行出错"),
+            detail: String(m.message || "执行出错"),
           });
           break;
         default:
           break;
       }
     };
-    ws.onmessage = (ev) => handle(ev.data);
-    ws.onerror = () => {};
     return () => {
+      closed = true;
       try {
-        ws?.close();
+        un?.();
       } catch {
         /* 关不掉就算了 */
       }
@@ -194,27 +180,14 @@ export class ComfyClient {
     promptId: string,
     onTick?: (elapsedMs: number) => void,
     timeoutMs = 60 * 60 * 1000
-  ): Promise<Asset[]> {    const started = Date.now();
-    let netErrors = 0;
+  ): Promise<Asset[]> {
+    const started = Date.now();
     while (Date.now() - started < timeoutMs) {
-      let entry: HistoryEntry | undefined;
-      try {
-        entry = await this.history(promptId);
-        netErrors = 0;
-      } catch {
-        // ComfyUI 可能临时失联（重启/高负载）：连续失败才报错
-        netErrors += 1;
-        if (netErrors >= 10) {
-          throw new Error("与 ComfyUI 失去连接（连续多次查询失败），请检查它是否还在运行");
-        }
-        await sleep(1500);
-        continue;
-      }
+      const entry = await this.history(promptId);
       if (entry) {
         const st = entry.status?.status_str;
         if (st === "error") {
-          const msgs = JSON.stringify(entry.status?.messages || []).slice(0, 500);
-          throw new Error(`执行失败：${msgs}`);
+          throw new Error(entry.error || "执行失败");
         }
         const assets = this.collectAssets(entry.outputs);
         if (assets.length > 0) return assets;

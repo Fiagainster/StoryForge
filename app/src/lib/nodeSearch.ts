@@ -1,10 +1,10 @@
-// 用 ?raw 读入再解析，避免 TS 为 447KB 的 JSON 生成类型
+// 用 ?raw 读入再解析，避免 TS 为 JSON 生成类型
 import rawText from "./node-library.json?raw";
 
 /* ------------------------------------------------------------------ *
- * 节点库
- * 由 scripts/build-node-library.mjs 从运行中的 ComfyUI 生成，
- * 只包含不依赖本地模型权重的节点（可直接执行）。
+ * 节点目录
+ * 内核时代的白名单：只有这里列出的节点能被原生内核执行，
+ * 图里出现目录外的 class_type 会在提交时被内核拒收。
  * ------------------------------------------------------------------ */
 
 export interface LibInput {
@@ -62,58 +62,24 @@ export const BLOCKED_INDEX = new Map<string, { why: string[] }>(
 
 /* ------------------------------------------------------------------ *
  * 核心工具箱：短剧全链路的骨架，每次对话都放进上下文
+ * 内核时代的节点目录：生成直连 ARK，像素杂活交给 ffmpeg，全部免权重
  * ------------------------------------------------------------------ */
 
 const CORE = [
-  // 生成（自建火山节点）
+  // 生成（直连火山 ARK）
+  "DramaCharacter",
+  "DramaShotFrame",
+  "DramaShotVideo",
+  "DramaContinuity",
   "StoryForgeSeedream",
   "StoryForgeSeedance",
   // 输入输出
   "EmptyImage",
-  "LoadImage",
-  "SaveImage",
-  "PreviewImage",
-  "GetImageSize",
-  // 画幅与构图
   "ImageScale",
-  "ImageCrop",
-  "ResizeAndPadImage",
-  "ImageStitch",
-  "CenterCropImages",
-  // 批次与序列
-  "ImageBatch",
-  "RepeatImageBatch",
-  "ImageGrid",
-  // 遮罩
-  "SolidMask",
-  "MaskToImage",
-  "ImageToMask",
-  "InvertMask",
-  "MaskComposite",
-  "FeatherMask",
-  "GrowMask",
-  // 合成
-  "ImageCompositeMasked",
-  "ImageBlend",
-  // 视频
-  "SaveVideo",
-  "CreateVideo",
-  "ConcatenateVideo",
-  "GetVideoComponents",
-  "VideoTrim",
-  "VideoCrop",
+  "LoadImage",
   "LoadVideo",
-  "FrameInterpolate",
-  // 音频
-  "LoadAudio",
-  "SaveAudio",
-  "AudioConcat",
-  "AudioAdjustVolume",
-  "EmptyAudio",
-  // 文本
-  "StringConcatenate",
-  "ReplaceText",
-  "TextOverlay",
+  "SaveImage",
+  "SaveVideo",
 ];
 
 /** 核心节点，按库中顺序去重 */

@@ -15,15 +15,14 @@ export function StatusBar({
   busy: boolean;
   stage: string;
 }) {
-  const { env, comfy, starting, startComfy, stopComfy, config, idleStopAt, idleStopMin } =
-    useStore();
+  const { env, comfy, config } = useStore();
 
-  const running = !!comfy?.running;
-  const port = config?.comfyPort ?? 8188;
+  const running = !!comfy?.running; // 内核常驻，恒为真
+  const ffmpegReady = !!env?.ffmpegReady;
   const modelsReady = !!env?.llmKeySet;
   const missing = [
-    !env?.nodesInstalled ? "节点缺失" : null,
-    !env?.venvExists ? "运行环境缺失" : null,
+    !env?.nodesInstalled ? "提示词缺失" : null,
+    !ffmpegReady ? "ffmpeg 缺失" : null,
   ].filter(Boolean) as string[];
 
   return (
@@ -41,45 +40,18 @@ export function StatusBar({
 
       <span className="h-4 w-[0.5px] shrink-0 bg-[var(--line-2)]" />
 
-      {/* 引擎 */}
+      {/* 内核：常驻，没有启停 */}
       <div className="flex shrink-0 items-center gap-1.5">
         <span
           className={cx(
             "size-1.5 rounded-full",
-            running
-              ? "bg-[var(--ok)] dot-live"
-              : starting
-              ? "bg-[var(--accent)] dot-live"
-              : "bg-[var(--fg-4)]"
+            running ? "bg-[var(--ok)] dot-live" : "bg-[var(--fg-4)]"
           )}
         />
-        <span className="t-12 text-[var(--fg-2)]">ComfyUI</span>
+        <span className="t-12 text-[var(--fg-2)]">内核</span>
         <span className="t-11 tabular text-[var(--fg-4)]">
-          {running ? `:${port}` : starting ? "启动中" : "未启动"}
+          {running ? (ffmpegReady ? "就绪" : "就绪 · 缺 ffmpeg") : "未就绪"}
         </span>
-        {running ? (
-          <Btn size="xs" variant="ghost" onClick={() => void stopComfy()} className="ml-0.5 text-[var(--fg-3)]">
-            停止
-          </Btn>
-        ) : (
-          <Btn
-            size="xs"
-            variant="outline"
-            onClick={() => void startComfy()}
-            disabled={starting}
-            className="ml-0.5"
-          >
-            {starting ? "启动中…" : "启动"}
-          </Btn>
-        )}
-        {running && idleStopAt ? (
-          <span
-            className="ml-1 t-11 text-[var(--fg-4)]"
-            title={`引擎开着一直占内存/显存：${idleStopMin} 分钟内没有新任务就自动停，再点「开始生成」会自己拉起来`}
-          >
-            · 空闲 {idleStopMin} 分自动停
-          </span>
-        ) : null}
       </div>
 
       {/* 模型 */}

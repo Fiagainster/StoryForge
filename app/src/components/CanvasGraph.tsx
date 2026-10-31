@@ -1279,7 +1279,7 @@ export function CanvasGraph({
             size="xs"
             variant="outline"
             onClick={() => onCancel?.()}
-            title="断开引擎，停止这次生成"
+            title="中断这次生成"
           >
             停止
           </Btn>

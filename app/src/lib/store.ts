@@ -128,7 +128,7 @@ interface Store {
   disarmIdleStop: () => void;
   setIdleStopMin: (min: number) => void;
 
-  /** 内部：确保 ComfyUI 在跑，没跑就自动拉起并等待就绪 */
+  /** 内部：确保内核就绪（常驻，瞬时完成） */
   ensureComfy: () => Promise<boolean>;
   init: () => Promise<void>;
   refreshComfy: () => Promise<void>;
@@ -191,9 +191,9 @@ interface Store {
   clearError: () => void;
 }
 
-const client = (config: AppConfig | null, comfy: ComfyStatus | null) => {
-  if (!config || !comfy?.running) return null;
-  return new ComfyClient(`http://127.0.0.1:${config.comfyPort}`);
+const client = (_config: AppConfig | null, _comfy: ComfyStatus | null) => {
+  // 原生内核常驻：不再看引擎进程的脸色，任何时刻都能提交
+  return new ComfyClient();
 };
 
 const SESSIONS_KEY = "storyforge.sessions.v2";
@@ -202,7 +202,7 @@ const SESSIONS_KEY = "storyforge.sessions.v2";
 const STOP_SENTINEL = "__cancelled_by_user__";
 
 const WELCOME_TEXT =
-  "我是你的导演台。说一句你想拍的东西，我就把分镜图搭到右边的画布上——不在这里报参数，你直接看画布、改画布，觉得对了点「开始生成」，我就逐镜跑。需要 ComfyUI 我会自己拉起来。\n\n还没接生成模型也能试：直接说「先来一张测试画面」，我用本地工作流在画布上真跑一张给你看。想自己搭节点，切到「工作流」页就能玩。";
+  "我是你的导演台。说一句你想拍的东西，我就把分镜图搭到右边的画布上——不在这里报参数，你直接看画布、改画布，觉得对了点「开始生成」，我就逐镜跑。生成内核常驻，随到随跑。\n\n还没接生成模型也能试：直接说「先来一张测试画面」，我用本地工作流在画布上真跑一张给你看。想自己搭节点，切到「工作流」页就能玩。";
 
 const welcome = (): ChatMessage => ({
   id: uid(),
@@ -502,7 +502,7 @@ export const useStore = create<Store>((set, get) => {
   };
 
   /**
-   * ComfyUI 的 /ws 进度 → 画布上的节点状态。
+   * 内核进度事件 → 画布上的节点状态。
    * 生成那几分钟里，人得看得见"现在跑到哪个节点、跑了多少"，
    * 而不是盯着一行「生成中」等。
    */
@@ -700,9 +700,9 @@ export const useStore = create<Store>((set, get) => {
       if (comfy.running) get().armIdleStop();
       get().addLog(
         "info",
-        `根目录：${env.projectRoot}｜ComfyUI：${env.comfyDirExists ? "已就绪" : "缺失"}｜节点：${
-          env.nodesInstalled ? "已安装" : "缺失"
-        }｜运行环境：${env.venvExists ? "已就绪" : "缺失"}`
+        `根目录：${env.projectRoot}｜工作区：${env.comfyBaseExists ? "已就绪" : "缺失"}｜提示词：${
+          env.nodesInstalled ? "已就绪" : "缺失"
+        }｜ffmpeg：${env.ffmpegReady ? "已就绪" : "缺失"}`
       );
     } catch (e) {
       set({ ready: true, error: String(e) });
@@ -720,27 +720,22 @@ export const useStore = create<Store>((set, get) => {
   },
 
   ensureComfy: async () => {
+    // 内核常驻：这一步从"等引擎起来"退化成"确认状态就绪"，瞬时完成
     if (get().comfy?.running) return true;
-    if (get().starting) {
-      for (let i = 0; i < 180; i++) {
-        await new Promise((r) => setTimeout(r, 1000));
-        if (get().cancelRequested) return false;
-        // 别让界面停在"校验画布"上一动不动：把等待秒数报出来
-        set({ stage: `等引擎就绪 · 已等 ${i + 1}s` });
-        if (get().comfy?.running) return true;
-        if (!get().starting) break;
-      }
-      return !!get().comfy?.running;
+    try {
+      await api.comfyStart();
+      const comfy = await api.comfyStatus();
+      set({ comfy });
+      return !!comfy.running;
+    } catch (e) {
+      get().addLog("error", `内核状态确认失败：${e}`);
+      return false;
     }
-    get().addLog("info", "ComfyUI 未启动，自动拉起…");
-    set({ stage: "正在拉起引擎" });
-    await get().startComfy();
-    return !!get().comfy?.running && !get().cancelRequested;
   },
 
   cancelRun: async () => {
     set({ cancelRequested: true, stage: "正在停止" });
-    get().addLog("warn", "已点停止：断开引擎，正在收尾");
+    get().addLog("warn", "已点停止：正在中断当前执行");
     await get().stopComfy();
     set({ starting: false, busy: false, runNodes: {}, runNow: null, stage: "", error: null });
   },
@@ -759,50 +754,27 @@ export const useStore = create<Store>((set, get) => {
   },
 
   startComfy: async () => {
-    set({ starting: true, error: null });
+    // 内核常驻，没有启动过程：确认状态即可
     try {
       await api.comfyStart();
-      get().addLog("info", "ComfyUI 正在启动…（CPU 模式首次加载约 10–30 秒）");
-      const deadline = Date.now() + 180_000;
-      while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 1500));
-        if (get().cancelRequested) {
-          set({ starting: false });
-          return;
-        }
-        const elapsed = Math.round((Date.now() - (deadline - 180_000)) / 1000);
-        set({ stage: `引擎启动中 · 已等 ${elapsed}s` });
-        const comfy = await api.comfyStatus();
-        if (comfy.running) {
-          set({ comfy, starting: false });
-          get().addLog("info", "ComfyUI 已就绪");
-          return;
-        }
-      }
-      // 超时不等于失败：CPU 模式冷启动本来就可能两三分钟，别吓唬人
-      const again = await api.comfyStatus().catch(() => null);
-      set({ starting: false, comfy: again ?? get().comfy });
-      if (again?.running) {
-        get().addLog("info", "ComfyUI 已就绪（刚好赶在超时之后）");
-        return;
-      }
-      get().addLog("warn", "引擎还在启动（已等 180s），可以稍后再点「开始生成」，或到日志页看它卡在哪");
+      const comfy = await api.comfyStatus();
+      set({ comfy, starting: false });
+      get().addLog("info", "内核已就绪");
     } catch (e) {
       set({ starting: false, error: String(e) });
-      get().addLog("error", `启动失败：${e}`);
+      get().addLog("error", `内核状态确认失败：${e}`);
     }
   },
 
   stopComfy: async () => {
+    // 「停止」的真实语义：掐掉当前在跑的执行（内核没有进程可停）
     get().disarmIdleStop();
     set({ starting: false });
     try {
       await api.comfyStop();
-      const comfy = await api.comfyStatus();
-      set({ comfy });
-      get().addLog("info", "ComfyUI 已停止");
+      get().addLog("info", "已中断当前执行");
     } catch (e) {
-      get().addLog("error", `停止失败：${e}`);
+      get().addLog("error", `中断失败：${e}`);
     }
   },
 
@@ -827,30 +799,8 @@ export const useStore = create<Store>((set, get) => {
   },
 
   armIdleStop: () => {
+    // 内核时代没有进程占显存，空闲自动停退役：留函数名是为了设置页的兼容
     get().disarmIdleStop();
-    const minutes = get().idleStopMin;
-    if (!minutes || !get().comfy?.running) return;
-    const ms = minutes * 60_000;
-    set({ idleStopAt: Date.now() + ms });
-    idleTimer = window.setTimeout(async () => {
-      idleTimer = null;
-      const s = get();
-      // 正在跑就别停：让人自己收尾
-      if (s.busy || s.starting) {
-        get().armIdleStop();
-        return;
-      }
-      if (!s.comfy?.running) {
-        set({ idleStopAt: null });
-        return;
-      }
-      set({ idleStopAt: null });
-      get().addLog(
-        "info",
-        `ComfyUI 空闲 ${minutes} 分钟，已自动停（显存还给你；下次点「开始生成」会自己拉起来）`
-      );
-      await get().stopComfy();
-    }, ms);
   },
 
   send: async (text) => {
@@ -1166,7 +1116,7 @@ export const useStore = create<Store>((set, get) => {
           runNodes: {},
           runNow: null,
           stage: "",
-          error: "引擎还没起来，画布内容已保留",
+          error: "内核未就绪，画布内容已保留",
           draft: { ...st.draft, status: "error" },
         }));
         return;
@@ -1361,15 +1311,12 @@ export const useStore = create<Store>((set, get) => {
     set({ busy: true, runNodes: {}, runNow: null, stage: "合成成片", error: null });
     try {
       const res = await api.assembleShots(runId, files, run.plan.title);
-      const { config } = get();
-      const port = config?.comfyPort ?? 8188;
       const asset: Asset = {
         filename: res.filename,
         subfolder: res.subfolder,
         type: "output",
-        url: `http://127.0.0.1:${port}/view?filename=${encodeURIComponent(
-          res.filename
-        )}&subfolder=${encodeURIComponent(res.subfolder)}&type=output`,
+        // 真身走 mediaSrc 的本地文件协议，这里只是兼容占位
+        url: `kernel://view?filename=${encodeURIComponent(res.filename)}&subfolder=${encodeURIComponent(res.subfolder)}`,
         kind: "video",
         duration: res.duration ?? undefined,
       };
@@ -1446,7 +1393,7 @@ export const useStore = create<Store>((set, get) => {
         runNodes: {},
         runNow: null,
         stage: "",
-        error: "ComfyUI 启动失败，改动已保留在画布上",
+        error: "内核未就绪，改动已保留在画布上",
         pendingGraph: { runId, graph },
       }));
       return;
@@ -1516,7 +1463,7 @@ export const useStore = create<Store>((set, get) => {
     try {
       const ok = await get().ensureComfy();
       if (!ok) {
-        set({ busy: false, runNodes: {}, runNow: null, stage: "", error: "ComfyUI 启动失败，请检查环境后重试" });
+        set({ busy: false, runNodes: {}, runNow: null, stage: "", error: "内核未就绪，请检查环境后重试" });
         return;
       }
       const { config } = get();
@@ -1646,10 +1593,9 @@ export const useStore = create<Store>((set, get) => {
       get().addLog("info", "配置已保存");
       const arkChanged =
         !!patch.ark && !!old && old.ark?.apiKey !== config.ark?.apiKey;
-      if (arkChanged && get().comfy?.running) {
-        get().addLog("info", "ARK Key 已变更，自动重启 ComfyUI 生效…");
-        await get().stopComfy();
-        await get().ensureComfy();
+      if (arkChanged) {
+        // 内核每次提交都现读配置，Key 改完下次生成立刻生效，无需重启任何东西
+        get().addLog("info", "ARK Key 已更新，下次生成即生效");
       }
     } catch (e) {
       get().addLog("error", `保存失败：${e}`);
