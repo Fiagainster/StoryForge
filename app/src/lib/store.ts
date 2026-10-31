@@ -38,6 +38,7 @@ import {
   extractPartialReply,
   humanError,
   runAgentTurn,
+  autonomousRun,
 } from "./agent";
 import type { StepEvent } from "./agent";
 
@@ -778,6 +779,59 @@ export const useStore = create<Store>((set, get) => {
           lessons: config?.memory?.learnings ?? [],
         }
       );
+
+      // 自主拍摄：用户明确授权的连续执行。确认门被跳过，安全闸 = budget.maxCny（没配就不启动）
+      if (result.autonomous) {
+        const maxCny = config?.budget?.maxCny ?? 0;
+        if (!(maxCny > 0)) {
+          endTurn(msgId, {
+            reply:
+              "自主拍摄需要先设总预算：设置 → 预算 → 单次金额上限（元）。连续多轮生成没有预算闸等于开着水龙头睡觉，我不开始。",
+          });
+          set({ busy: false, stage: "" });
+          return;
+        }
+        const auto = await autonomousRun(
+          result.autonomous.goal,
+          c,
+          {
+            onLog: (level, m2) => get().addLog(level, m2),
+            onStage: (st) => set({ stage: st }),
+            onDelta: h.onDelta,
+            onStep: h.onStep,
+            onNode: h.onNode,
+            onLesson: (lesson) => void get().addLearning(lesson),
+          },
+          {
+            hasArkKey: !!config?.ark?.apiKey,
+            imageModel: config?.image?.model,
+            imageSize: config?.image?.size,
+            videoModel: config?.video?.model,
+            videoResolution: config?.video?.resolution,
+            generateAudio: config?.video?.generateAudio !== false,
+            budget: config?.budget,
+            lessons: config?.memory?.learnings ?? [],
+            maxCny,
+            maxRounds: result.autonomous.maxRounds,
+            cancelled: () => get().cancelRequested,
+          }
+        );
+        const lastRun = auto.runs[auto.runs.length - 1];
+        endTurn(msgId, { reply: auto.reply, error: auto.error, graph: lastRun?.graph });
+        set((s) => ({
+          runs: auto.runs.length ? [...auto.runs].reverse().concat(s.runs) : s.runs,
+          busy: false,
+          runNodes: {},
+          runNow: null,
+          stage: "",
+          cancelRequested: false,
+          tab: lastRun ? "shots" : s.tab,
+          error: auto.error || null,
+          // 画布切到最后一版的产出，和分镜页对得上
+          draft: lastRun ? { ...docFromRun(lastRun), ts: Date.now() } : s.draft,
+        }));
+        return;
+      }
 
       endTurn(msgId, {
         reply: result.reply,

@@ -20,8 +20,10 @@
     "src/lib/graphAudit.ts",
     "src/lib/nodeSearch.ts",
     "src/lib/shot-merge.ts",
+    "src/lib/autonomous.ts",
     "src/lib/plan.test.ts",
     "src/lib/graphOps.test.ts",
-    "src/lib/graphAudit.test.ts"
+    "src/lib/graphAudit.test.ts",
+    "src/lib/autonomous.test.ts"
   ]
 }

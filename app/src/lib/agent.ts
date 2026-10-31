@@ -72,6 +72,10 @@ ${NODES.map((n) => `${n.n} — ${n.d} · ${n.c}`).join("\n")}\n`
    - 判断标准：用户没有明确要拍具体内容，就是聊天。哪怕只说了「你好」「在吗」，也必须输出 chat:true，绝不要输出 plan 字段。
    - 例子：「你好」→ {"reply":"你好！说一句想拍的东西，我把分镜图搭到右边画布上，你在画布改到满意再点开始生成。","chat":true}
 4. 确实做不到时 → {"reply":"说明缺什么","plan":null}
+5. **用户明确授权自主拍摄**（说了"自主拍 / 全自动拍 / 给你个目标你自己干 / 不用管我连着拍"这类话）→ {"reply":"一句话确认目标与轮数","autonomous":{"goal":"对用户拍摄意图的完整重述（题材/风格/时长/镜数偏好都在里面）","maxRounds":2}}
+   - 只有用户明确交出控制权时才用；普通"拍一个 xxx"走第 1 种，绝不要替用户决定自主。
+   - goal 必须是自包含的完整重述，后续每一轮都只看这句话；maxRounds 默认 2、最多 4。
+   - 自主模式没有逐版确认，安全闸是用户设的总预算——reply 里提一句预算耗尽会自动停。
 
 ## 计划格式（仅第 1 种时输出）
 {
@@ -611,6 +615,172 @@ export async function executePlanWithRepair(
   };
 }
 
+/* ------------------------------------------------------------------ *
+ * 自主执行循环：给一个目标，智能体自己出计划 → 执行 → 自评 → 迭代，
+ * 直到达标 / 预算耗尽 / 轮数上限。确认门在这里被跳过——
+ * 安全闸换成「单次金额上限」（maxCny），没配就不允许启动。
+ * 纯逻辑（决策 / 提示词）在 ./autonomous.ts，可独立单测。
+ * ------------------------------------------------------------------ */
+
+export type { AutonomousRequest, AutonomousAction } from "./autonomous.js";
+export { autonomousDecision, buildAutonomousMessages } from "./autonomous.js";
+import { autonomousDecision, buildAutonomousMessages } from "./autonomous.js";
+import type { AutonomousRequest } from "./autonomous.js";
+
+export interface AutonomousResult {
+  reply: string;
+  rounds: number;
+  spentCny: number;
+  runs: RunRecord[];
+  error?: string;
+}
+
+/**
+ * 自主执行主循环。调用前置条件：
+ * - opts.maxCny > 0（总预算硬闸，没配就拒绝启动）
+ * - opts.hasArkKey（无生成 Key 时云端节点走占位图，只用于验证链路，不产出真片）
+ */
+export async function autonomousRun(
+  goal: string,
+  client: ComfyClient | null,
+  cb: RunCallbacks = {},
+  opts: ExecuteOptions & {
+    maxCny: number;
+    maxRounds?: number;
+    /** 取消旗标（store 的 cancelRequested），每轮开始前查一次 */
+    cancelled?: () => boolean;
+  }
+): Promise<AutonomousResult> {
+  const log = cb.onLog || (() => {});
+  const stage = cb.onStage || (() => {});
+  const maxRounds = Math.max(1, Math.min(4, opts.maxRounds ?? 2));
+  const maxCny = opts.maxCny;
+
+  if (!(maxCny > 0)) {
+    return {
+      reply:
+        "自主模式必须先设置单次金额上限（设置 → 预算 → 单次金额上限）：连续多轮生成没有预算闸等于开着水龙头睡觉。",
+      rounds: 0,
+      spentCny: 0,
+      runs: [],
+      error: "NO_BUDGET",
+    };
+  }
+  if (!client) {
+    return { reply: "内核未就绪，自主模式无法启动。", rounds: 0, spentCny: 0, runs: [], error: "NO_KERNEL" };
+  }
+
+  const runs: RunRecord[] = [];
+  const lessons = [...(opts.lessons ?? [])];
+  let spent = 0;
+  let lastOk = false;
+  let lastSummary = "";
+  let round = 0;
+  let stopWhy = "";
+
+  for (;;) {
+    round++;
+    // 决策：是否继续（轮数/预算/取消在出计划之前查，别先烧钱再看闸门）
+    const decision = autonomousDecision({
+      round,
+      maxRounds,
+      spentCny: spent,
+      maxCny,
+      lastRunOk: lastOk,
+      modelDone: false, // modelDone 在本轮模型输出里才出现；这里只查硬闸
+      cancelled: opts.cancelled?.() ?? false,
+    });
+    if (decision.action !== "run") {
+      stopWhy = decision.why;
+      break;
+    }
+
+    stage(`自主执行 · 第 ${round}/${maxRounds} 轮`);
+    log("info", `自主第 ${round} 轮：已花费 ¥${spent.toFixed(2)} / 总预算 ¥${maxCny.toFixed(2)}`);
+
+    // 1. 出计划（模型本轮可声明 done，但只在 lastOk 时兑现——声明不等于事实）
+    const roundLessons: string[] = [];
+    const roundCb: RunCallbacks = {
+      ...cb,
+      onLesson: (l) => {
+        roundLessons.push(l);
+        cb.onLesson?.(l);
+      },
+    };
+    let plan: DramaPlan | null = null;
+    try {
+      const messages = buildAutonomousMessages(goal, round, maxRounds, spent, maxCny, lastSummary, lessons);
+      const resp = await llmJsonChat(messages, roundCb, `自主第 ${round} 轮 · 出计划`);
+      const parsed = parseJsonLoose(resp.content ?? "");
+      if (!parsed) throw new Error("模型输出不可用");
+      if (parsed.done === true && lastOk) {
+        stopWhy = "模型确认目标达成";
+        break;
+      }
+      const p = parsePlan(parsed.plan);
+      for (const w of p.warnings) log("warn", w);
+      plan = applyBudget(p.plan, opts.budget).plan;
+      if (typeof parsed.lesson === "string" && parsed.lesson.trim()) {
+        const l = parsed.lesson.trim().slice(0, 200);
+        lessons.push(l);
+        log("info", `沉淀经验：${l}`);
+        opts.onLesson?.(l);
+      }
+    } catch (e) {
+      return {
+        reply: `自主第 ${round} 轮出计划失败：${e}`,
+        rounds: round - 1,
+        spentCny: Math.round(spent * 100) / 100,
+        runs,
+        error: String(e),
+      };
+    }
+
+    // 2. 执行（免确认直达；单次提交的 cap 拦截在内核仍然生效）
+    const stats = planStats(plan);
+    log("info", `第 ${round} 轮计划：${stats.shots} 镜 · 约 ${stats.seconds}s`);
+    const result = await compileAndRun(
+      plan,
+      {
+        hasArkKey: opts.hasArkKey ?? true,
+        imageModel: opts.imageModel,
+        imageSize: opts.imageSize,
+        videoModel: opts.videoModel,
+        videoResolution: opts.videoResolution,
+        generateAudio: opts.generateAudio,
+      },
+      client,
+      roundCb,
+      { reply: `自主第 ${round} 轮`, degraded: false, note: `自主拍摄 · 第 ${round} 轮` }
+    );
+    if (result.run) {
+      runs.push(result.run);
+      spent += result.run.usage?.costCny ?? 0;
+    }
+    const auditNote = roundLessons.length ? `；自审发现：${roundLessons.join("；")}` : "";
+    if (result.error) {
+      lastOk = false;
+      lastSummary = `执行失败：${result.error}${auditNote}`;
+      log("warn", `第 ${round} 轮执行失败，进入下一轮修订（若还有轮次与预算）`);
+    } else if (result.run) {
+      lastOk = result.run.assets.length > 0;
+      lastSummary = `产出 ${result.run.assets.length} 个文件，花费 ¥${(result.run.usage?.costCny ?? 0).toFixed(2)}${auditNote}`;
+    } else {
+      lastOk = false;
+      lastSummary = `本轮没有产出${auditNote}`;
+    }
+  }
+
+  const lastRun = runs[runs.length - 1];
+  const tail = lastRun ? `最后一版：${lastRun.plan?.title ?? "无标题"}（${lastRun.assets.length} 个文件）。` : "";
+  return {
+    reply: `自主执行结束（${runs.length} 轮产出，共花费 ¥${spent.toFixed(2)}）：${stopWhy}${tail ? `\n${tail}` : ""}`,
+    rounds: runs.length,
+    spentCny: Math.round(spent * 100) / 100,
+    runs,
+  };
+}
+
 function stage(cb: RunCallbacks, s: string) {
   cb.onStage?.(s);
 }
@@ -929,6 +1099,8 @@ export interface AgentResult {
   error?: string;
   /** 智能体通过 ops 协议改了现有图，改动进画布等人审查 */
   graphEdited?: boolean;
+  /** 用户明确授权自主拍摄：store 收到后直接进 autonomousRun 连续执行 */
+  autonomous?: AutonomousRequest;
   /** 计划是"往后追加新镜"而不是整版重铺：store 编译时从现有最大镜号+1 接着编 */
   append?: boolean;
   /** 本轮对话模型用量（token） */
@@ -1142,6 +1314,18 @@ export async function runAgentTurn(
   if (parsed?.chat) {
     const chatReply = String(parsed.reply ?? "").trim();
     return done({ reply: chatReply || "嗯。", degraded });
+  }
+  // 自主拍摄：用户明确授权，出目标交给 store 跑 autonomousRun（连续执行，预算硬闸）
+  if (parsed?.autonomous && typeof parsed.autonomous.goal === "string" && parsed.autonomous.goal.trim()) {
+    return done({
+      reply: parsed.reply || `收到，目标「${String(parsed.autonomous.goal).trim()}」，开始自主执行——每一轮结束我会汇报进展与花费。`,
+      autonomous: {
+        goal: String(parsed.autonomous.goal).trim().slice(0, 200),
+        maxRounds: Math.max(1, Math.min(4, Number(parsed.autonomous.maxRounds) || 2)),
+      },
+      degraded,
+      usage: { llmTokens, images: 0, videoSeconds: 0 },
+    });
   }
   // 没带 chat 字段但也没有 plan/ops/graph —— 同样按对话处理
   if (
