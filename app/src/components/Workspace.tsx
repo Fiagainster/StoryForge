@@ -262,6 +262,7 @@ function LivePlan({
   runNodes,
   busy,
   estimate,
+  budgetCny,
   hasAlt,
   onSwap,
   onRun,
@@ -272,6 +273,8 @@ function LivePlan({
   runNodes: Record<string, NodeRun>;
   busy: boolean;
   estimate: CostEstimate | null;
+  /** 单次金额上限（元），0 或缺省 = 不限；预估超出时着警示色 */
+  budgetCny?: number;
   hasAlt?: boolean;
   onSwap?: () => void;
   onRun: () => void;
@@ -306,9 +309,16 @@ function LivePlan({
           </div>
           <div className="mt-0.5 t-11 tabular text-[var(--fg-4)]">
             {plan.shots.length} 镜 · 约 {seconds}s
-            {estimate
-              ? ` · 预计 ${fmtCny(estimate.low)}（含重试缓冲至多 ${fmtCny(estimate.high)}）`
-              : ""}
+            {estimate ? (
+              budgetCny && budgetCny > 0 && estimate.high > budgetCny ? (
+                <span className="text-[var(--warn)]">
+                  {" · 预计 "}{fmtCny(estimate.low)}，含重试缓冲至多 {fmtCny(estimate.high)}
+                  ，已超单次上限 {fmtCny(budgetCny)}
+                </span>
+              ) : (
+                <>· 预计 {fmtCny(estimate.low)}（含重试缓冲至多 {fmtCny(estimate.high)}）</>
+              )
+            ) : null}
             {live ? ` · 已完成 ${done}/${plan.shots.length}` : ""}
             {live && runningNow >= 0 ? ` · 正在跑第 ${runningNow + 1} 镜` : ""}
             {!live && errs ? ` · ${errs} 镜出错` : ""}
@@ -1010,6 +1020,7 @@ export function Workspace({ chatOpen, onOpenChat }: { chatOpen: boolean; onOpenC
     clearLogs,
     moveShot,
     resetShotOrder,
+    config,
   } = useStore();
 
   const [zoom, setZoom] = useState<{ list: Asset[]; index: number } | null>(null);
@@ -1230,6 +1241,7 @@ export function Workspace({ chatOpen, onOpenChat }: { chatOpen: boolean; onOpenC
                     runNodes={runNodes}
                     busy={busy}
                     estimate={estimate}
+                    budgetCny={config?.budget?.maxCny}
                     hasAlt={!!draft.planAlt}
                     onSwap={() => swapPlanVariant()}
                     onRun={() => void runDraft()}

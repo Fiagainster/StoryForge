@@ -782,10 +782,14 @@ const AUDIT_GEN_NODES: &[&str] = &[
 /// 自审不合格后的自动重跑轮数上限（不含首次生成）
 const AUDIT_MAX_RETRY: u32 = 2;
 
-/// 全黑判定阈值（signalstats YAVG，YUV limited range：纯黑=16，夜戏安全余量）
+/// 全黑判定阈值：平均亮度（signalstats YAVG，YUV limited range：纯黑=16，夜戏安全余量）
 const DARK_LIMIT: f64 = 18.0;
-/// 全白判定阈值（YUV limited range：纯白=235）
+/// 全黑判定阈值：峰值亮度（YMAX）。真黑屏是"又暗又无细节"；夜戏 avg 低但灯光点会把 YMAX 拉高 → 安全放行
+const BLACK_MAX_LIMIT: f64 = 40.0;
+/// 全白判定阈值：平均亮度（YUV limited range：纯白=235）
 const BRIGHT_LIMIT: f64 = 232.0;
+/// 全白判定阈值：谷值亮度（YMIN）。真白屏是"又亮又无细节"
+const WHITE_MIN_LIMIT: f64 = 220.0;
 /// 视频实测时长与计划时长的允许偏差（秒）
 const DURATION_TOLERANCE: f64 = 1.5;
 /// 分辨率短边允许下探比例（Seedance ratio=adaptive 时可能微调）
@@ -840,24 +844,48 @@ fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
     Some((w, h))
 }
 
-/// 从 ffmpeg 输出文本里取最后一次出现的 YAVG（signalstats 平均亮度，0-255）
-fn parse_yavg(text: &str) -> Option<f64> {
-    let mut yavg = None;
-    for part in text.split("YAVG=") {
-        let num: String = part
-            .trim_start()
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
-            .collect();
-        if let Ok(v) = num.parse::<f64>() {
-            yavg = Some(v);
-        }
-    }
-    yavg
+/// signalstats 采到的单帧亮度三元组（0-255，YUV limited range）
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+struct Luma {
+    avg: f64,
+    max: f64,
+    min: f64,
 }
 
-/// 用 signalstats 算一帧的平均亮度。seek: None=首帧，Some(t)=定位到 t 秒。
-fn frame_brightness(ffmpeg: &Path, src: &str, seek: Option<&str>) -> Option<f64> {
+/// 真黑屏 = 又暗又无细节（avg 低且 max 也低）。夜戏 avg 低但灯光点拉高 max → 不是黑屏
+fn is_all_black(l: &Luma) -> bool {
+    l.avg < DARK_LIMIT && l.max < BLACK_MAX_LIMIT
+}
+
+/// 真白屏 = 又亮又无细节（avg 高且 min 也高）
+fn is_all_white(l: &Luma) -> bool {
+    l.avg > BRIGHT_LIMIT && l.min > WHITE_MIN_LIMIT
+}
+
+/// 从 ffmpeg 输出文本里取各指标最后一次出现的数值（signalstats 每帧打印一组）
+fn parse_luma(text: &str) -> Option<Luma> {
+    let grab = |tag: &str| -> Option<f64> {
+        let mut got = None;
+        for part in text.split(tag) {
+            let num: String = part
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+                .collect();
+            if let Ok(v) = num.parse::<f64>() {
+                got = Some(v);
+            }
+        }
+        got
+    };
+    let avg = grab("YAVG=")?;
+    let max = grab("YMAX=")?;
+    let min = grab("YMIN=")?;
+    Some(Luma { avg, max, min })
+}
+
+/// 用 signalstats 采一帧的亮度三元组。seek: None=首帧，Some(t)=定位到 t 秒。
+fn frame_luma(ffmpeg: &Path, src: &str, seek: Option<&str>) -> Option<Luma> {
     let mut args: Vec<&str> = vec!["-y", "-hide_banner"];
     if let Some(t) = seek {
         args.push("-ss");
@@ -865,7 +893,7 @@ fn frame_brightness(ffmpeg: &Path, src: &str, seek: Option<&str>) -> Option<f64>
     }
     args.extend([
         "-i", src, "-frames:v", "1",
-        "-vf", "signalstats,metadata=print:key=lavfi.signalstats.YAVG",
+        "-vf", "signalstats,metadata=print",
         "-f", "null", "-",
     ]);
     let mut cmd = std::process::Command::new(ffmpeg);
@@ -878,7 +906,7 @@ fn frame_brightness(ffmpeg: &Path, src: &str, seek: Option<&str>) -> Option<f64>
         String::from_utf8_lossy(&out.stderr),
         String::from_utf8_lossy(&out.stdout)
     );
-    parse_yavg(&text)
+    parse_luma(&text)
 }
 
 /// 视频流信息：宽 / 高 / fps / 是否有音轨
@@ -931,13 +959,19 @@ fn audit_image(ffmpeg: &Path, tmp_dir: &Path, img: &ImageVal, size_param: &str) 
     if std::fs::write(&tmp, &img.bytes).is_err() {
         return Audit::pass(vec!["自检临时文件写失败，跳过质检".into()], details);
     }
-    let bright = frame_brightness(ffmpeg, tmp.to_str().unwrap_or(""), None);
+    let luma = frame_luma(ffmpeg, tmp.to_str().unwrap_or(""), None);
     let _ = std::fs::remove_file(&tmp);
-    details["brightness"] = json!(bright);
-    match bright {
-        Some(b) if b < DARK_LIMIT => failed.push(format!("画面全黑（平均亮度 {b:.1}/255）")),
-        Some(b) if b > BRIGHT_LIMIT => failed.push(format!("画面全白（平均亮度 {b:.1}/255）")),
-        Some(b) => notes.push(format!("亮度 {b:.0}/255")),
+    details["brightness"] = json!(luma);
+    match luma {
+        Some(l) if is_all_black(&l) => failed.push(format!(
+            "画面全黑（平均亮度 {:.1}/255，峰值 {:.0}，无细节）",
+            l.avg, l.max
+        )),
+        Some(l) if is_all_white(&l) => failed.push(format!(
+            "画面全白（平均亮度 {:.1}/255，谷值 {:.0}，无细节）",
+            l.avg, l.min
+        )),
+        Some(l) => notes.push(format!("亮度 {:.0}/255（峰 {:.0} 谷 {:.0}）", l.avg, l.max, l.min)),
         None => notes.push("亮度检测失败，已跳过".into()),
     }
     if let Some((w, h)) = png_size(&img.bytes) {
@@ -1033,20 +1067,26 @@ fn audit_video(
         None => failed.push("ffprobe 读不到流信息，文件可能损坏".into()),
     }
 
-    // 首 / 中 / 尾三帧亮度采样，全黑全白判废
+    // 首 / 中 / 尾三帧亮度采样，全黑全白判废（双条件：又暗又无细节才算黑屏）
     if let Some(d) = dur.filter(|d| *d > 0.0) {
-        let mut samples: Vec<Option<f64>> = vec![frame_brightness(ffmpeg, src, None)];
-        samples.push(frame_brightness(ffmpeg, src, Some(&format!("{:.2}", d * 0.5))));
-        samples.push(frame_brightness(ffmpeg, src, Some(&format!("{:.2}", (d - 0.6).max(0.0)))));
-        let got: Vec<f64> = samples.iter().filter_map(|b| *b).collect();
+        let mut samples: Vec<Option<Luma>> = vec![frame_luma(ffmpeg, src, None)];
+        samples.push(frame_luma(ffmpeg, src, Some(&format!("{:.2}", d * 0.5))));
+        samples.push(frame_luma(ffmpeg, src, Some(&format!("{:.2}", (d - 0.6).max(0.0)))));
+        let got: Vec<Luma> = samples.iter().filter_map(|l| *l).collect();
         details["brightness_samples"] = json!(samples);
         if got.len() >= 2 {
-            if got.iter().all(|b| *b < DARK_LIMIT) {
-                failed.push(format!("画面全黑（{} 帧采样亮度均 <{DARK_LIMIT:.0}/255）", got.len()));
-            } else if got.iter().all(|b| *b > BRIGHT_LIMIT) {
-                failed.push(format!("画面全白（{} 帧采样亮度均 >{BRIGHT_LIMIT:.0}/255）", got.len()));
+            if got.iter().all(is_all_black) {
+                failed.push(format!(
+                    "画面全黑（{} 帧采样平均亮度均 <{DARK_LIMIT:.0}/255 且峰值均 <{BLACK_MAX_LIMIT:.0}，无细节）",
+                    got.len()
+                ));
+            } else if got.iter().all(is_all_white) {
+                failed.push(format!(
+                    "画面全白（{} 帧采样平均亮度均 >{BRIGHT_LIMIT:.0}/255 且谷值均 >{WHITE_MIN_LIMIT:.0}，无细节）",
+                    got.len()
+                ));
             } else {
-                let disp: Vec<String> = got.iter().map(|b| format!("{b:.0}")).collect();
+                let disp: Vec<String> = got.iter().map(|l| format!("{:.0}", l.avg)).collect();
                 notes.push(format!("亮度采样 {}/255", disp.join("/")));
             }
         } else {
@@ -2618,10 +2658,32 @@ mod audit_tests {
     }
 
     #[test]
-    fn yavg_parse() {
-        assert_eq!(parse_yavg("frame:0 pts:0\nlavfi.signalstats.YAVG=57.375000"), Some(57.375));
-        assert_eq!(parse_yavg("no data here"), None);
-        assert_eq!(parse_yavg("YAVG=0.0 later YAVG=12.5"), Some(12.5), "取最后一次");
+    fn luma_parse() {
+        let text = "frame:0 pts:0\nlavfi.signalstats.YMIN=16.0\nlavfi.signalstats.YAVG=57.375000\nlavfi.signalstats.YMAX=120.0";
+        let l = parse_luma(text).expect("应解析出三元组");
+        assert_eq!(l.avg, 57.375);
+        assert_eq!(l.max, 120.0);
+        assert_eq!(l.min, 16.0);
+        assert_eq!(parse_luma("no data here"), None);
+        // 缺任一指标都不算采到
+        assert_eq!(parse_luma("YAVG=12.5 YMAX=30.0"), None, "缺 YMIN");
+        assert_eq!(parse_luma("YAVG=0.0 later YAVG=12.5"), None, "取最后一次但缺其他指标");
+    }
+
+    #[test]
+    fn dark_scene_not_black_screen() {
+        // 夜戏：平均亮度低于 DARK_LIMIT，但有灯光点（YMAX 高）→ 不能判黑屏
+        let night = Luma { avg: 15.0, max: 110.0, min: 5.0 };
+        assert!(!is_all_black(&night));
+        // 真黑屏：又暗又无细节
+        let black = Luma { avg: 16.0, max: 16.2, min: 16.0 };
+        assert!(is_all_black(&black));
+        // 白屏双条件
+        let white = Luma { avg: 240.0, max: 235.0, min: 230.0 };
+        assert!(is_all_white(&white));
+        // 高亮但暗部有细节（高对比夜景）→ 不是白屏
+        let contrast = Luma { avg: 240.0, max: 235.0, min: 40.0 };
+        assert!(!is_all_white(&contrast));
     }
 
     #[test]

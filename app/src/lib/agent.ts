@@ -105,7 +105,7 @@ ${NODES.map((n) => `${n.n} — ${n.d} · ${n.c}`).join("\n")}\n`
 想给用户导演式的选择时，额外输出 "planB"：与 plan 同结构的一版完整计划，必须有明显的导演级差异（情绪弧线不同：如一版克制压抑、一版外放爆发；或节奏不同：如一版碎剪短镜、一版长镜缓推），不是只改几个词。只给一个方案时不要输出 planB。
 
 ## 计划硬性规则
-- 默认 1-3 个镜头；只有用户明确要求多镜，才加到最多 6 个。不擅自加戏。
+- 默认克制：1-3 个镜头，不擅自加戏。用户明确要几镜就给几镜，不要替用户设上限——镜头数超出预算时会被自动截断，你只管按内容需要给够。
 - shotSize 只能是：大远景、远景、全景、中景、中近景、近景、特写、大特写。
 - camera 只能是：固定、缓慢推近、缓慢拉远、横移、跟拍、手持、环绕、俯拍、仰拍。
 - duration 默认 4-6 秒，一般不超过 8 秒；只有用户明确要长镜头，才用 9-15 秒。
@@ -221,6 +221,8 @@ interface RunCallbacks {
   onStep?: (step: StepEvent) => void;
   /** ComfyUI 实时进度：哪个节点在跑、跑到几成 */
   onNode?: (e: WatchEvent) => void;
+  /** 内核自审发现的不合格原因，交回调用方沉淀进经验记忆 */
+  onLesson?: (lesson: string) => void;
 }
 
 const isVideoAsset = (a: { kind?: string; url: string }) =>
@@ -262,6 +264,7 @@ async function submitAndWait(
    */
   const shotCost: Record<string, ShotCost> = {};
   const seenNodes: Record<string, Set<string>> = {};
+  const auditReasons = new Set<string>();
   let curShot: number | null = null;
   let curAt = 0;
   let lastEndAt = startedAt;
@@ -307,6 +310,13 @@ async function submitAndWait(
           else seen.add(e.node);
         }
       }
+      // 内核自审不合格的原因：喂回经验记忆，之后出计划规避同类缺陷
+      if (e.kind === "progress" && e.detail?.startsWith("自审不合格")) {
+        const reason = e.detail.includes("按原样保留：")
+          ? e.detail.split("按原样保留：")[1]?.trim()
+          : /自审不合格（(.+?)）/.exec(e.detail)?.[1];
+        if (reason) auditReasons.add(reason.slice(0, 120));
+      }
     } else if (e.kind === "done" || e.kind === "error") {
       closeShot();
     }
@@ -328,6 +338,11 @@ async function submitAndWait(
   }
   const usage = usageFromAssets(assets, llmTokens);
   if (cost) usage.costCny = Math.round(cost.actual * 100) / 100;
+  if (auditReasons.size) {
+    const lesson = `内核自审发现：${[...auditReasons].join("；")}——出计划时规避同类缺陷`;
+    log("info", `沉淀经验：${lesson}`);
+    cb.onLesson?.(lesson);
+  }
   log(
     "info",
     `完成，产出 ${assets.length} 个文件（${usage.images} 图 · ${usage.videoSeconds}s 视频 · LLM ${usage.llmTokens} tokens）${
@@ -531,7 +546,8 @@ export async function executePlan(
       llmTokens: opts.llmTokens,
     },
     client,
-    cb,
+    // 自审不合格沉淀经验的出口接上调用方（store.addLearning）
+    { ...cb, onLesson: opts.onLesson },
     { reply, degraded: false, note: opts.note }
   );
 }
