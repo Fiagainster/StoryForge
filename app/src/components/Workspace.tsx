@@ -261,6 +261,8 @@ function LivePlan({
   runNodes,
   busy,
   estimate,
+  hasAlt,
+  onSwap,
   onRun,
   onStop,
 }: {
@@ -269,6 +271,8 @@ function LivePlan({
   runNodes: Record<string, NodeRun>;
   busy: boolean;
   estimate: CostEstimate | null;
+  hasAlt?: boolean;
+  onSwap?: () => void;
   onRun: () => void;
   onStop: () => void;
 }) {
@@ -315,16 +319,23 @@ function LivePlan({
             停止
           </Btn>
         ) : (
-          <Btn
-            size="xs"
-            variant="primary"
-            icon={I.play(10)}
-            disabled={busy}
-            onClick={onRun}
-            title="按画布上现在这张图开跑"
-          >
-            {status === "error" ? "再试一次" : "开始生成"}
-          </Btn>
+          <div className="flex items-center gap-1.5">
+            {hasAlt ? (
+              <Btn size="xs" variant="outline" disabled={busy} onClick={onSwap} title="换成对话里的另一版方案（再点一次换回来）">
+                换另一版
+              </Btn>
+            ) : null}
+            <Btn
+              size="xs"
+              variant="primary"
+              icon={I.play(10)}
+              disabled={busy}
+              onClick={onRun}
+              title="按画布上现在这张图开跑"
+            >
+              {status === "error" ? "再试一次" : "开始生成"}
+            </Btn>
+          </div>
         )}
       </div>
 
@@ -994,6 +1005,7 @@ export function Workspace({ chatOpen, onOpenChat }: { chatOpen: boolean; onOpenC
     send,
     runNodes,
     runNow,
+    swapPlanVariant,
     clearLogs,
     moveShot,
     resetShotOrder,
@@ -1195,6 +1207,8 @@ export function Workspace({ chatOpen, onOpenChat }: { chatOpen: boolean; onOpenC
                     runNodes={runNodes}
                     busy={busy}
                     estimate={estimate}
+                    hasAlt={!!draft.planAlt}
+                    onSwap={() => swapPlanVariant()}
                     onRun={() => void runDraft()}
                     onStop={() => void cancelRun()}
                   />

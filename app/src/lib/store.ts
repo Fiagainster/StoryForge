@@ -61,6 +61,8 @@ export interface CanvasDoc {
   id: string;
   graph: ComfyGraph;
   plan?: DramaPlan;
+  /** P1-3 双方案：备选变体，确认门上可一键互换 */
+  planAlt?: DramaPlan;
   title: string;
   status: "draft" | "running" | "done" | "error";
   note?: string;
@@ -139,6 +141,8 @@ interface Store {
   setDraftGraph: (g: ComfyGraph) => void;
   /** 执行当前画布（唯一的生成入口） */
   runDraft: () => Promise<void>;
+  /** P1-3 双方案：A/B 两版互换（plan ↔ planAlt），换完重编译画布 */
+  swapPlanVariant: () => void;
   /** 丢掉画布改动，回到最近一次执行的那张图 */
   resetDraft: () => void;
   rerunShot: (runId: string, shotIndex: number) => Promise<void>;
@@ -963,6 +967,7 @@ export const useStore = create<Store>((set, get) => {
               id: uid(),
               graph: checked.graph,
               plan: result.plan,
+              planAlt: result.planAlt,
               title: result.plan.title,
               status: "draft",
               note: result.reply.split("\n")[0],
@@ -1053,6 +1058,46 @@ export const useStore = create<Store>((set, get) => {
         ts: Date.now(),
       },
     });
+  },
+
+  swapPlanVariant: () => {
+    const { draft, config } = get();
+    if (!draft.plan || !draft.planAlt || draft.status === "running") return;
+    const prev = draft.plan;
+    const next = draft.planAlt;
+    const compiled = compilePlan(next, {
+      imageModel: config?.image?.model ?? "",
+      imageSize: config?.image?.size ?? "1080x1920",
+      videoModel: config?.video?.model ?? "",
+      videoResolution: config?.video?.resolution ?? "720p",
+      generateAudio: config?.video?.generateAudio !== false,
+      withVideo: !!config?.ark?.apiKey && next.mode === "video",
+      continuity: true,
+    });
+    const checked = validateAndRepair(compiled);
+    if (blockingIssues(auditGraph(checked.graph)).length) {
+      get().addLog("error", "另一版编译出来跑不起来，没换。可以看对话里的风险提示让 AI 重出。");
+      return;
+    }
+    set({
+      draft: {
+        ...draft,
+        graph: checked.graph,
+        plan: next,
+        planAlt: prev,
+        title: next.title,
+        status: "draft",
+        change: diffGraph(draft.graph, checked.graph),
+        rebuild: undefined,
+        fromAI: false,
+        changedAt: Date.now(),
+        ts: Date.now(),
+      },
+      runNodes: {},
+      runNow: null,
+      tab: "graph",
+    });
+    get().addLog("info", `已切到「${next.title}」，画布重编译完成；再点一次可换回「${prev.title}」。`);
   },
 
   runDraft: async () => {

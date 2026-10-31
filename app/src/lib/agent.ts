@@ -97,8 +97,12 @@ ${NODES.map((n) => `${n.n} — ${n.d} · ${n.c}`).join("\n")}\n`
         "generateAudio": true
       }
     ]
-  }
+  },
+  "planB": {…与 plan 同结构，可选…}
 }
+
+## 双方案（可选，有把握时才给）
+想给用户导演式的选择时，额外输出 "planB"：与 plan 同结构的一版完整计划，必须有明显的导演级差异（情绪弧线不同：如一版克制压抑、一版外放爆发；或节奏不同：如一版碎剪短镜、一版长镜缓推），不是只改几个词。只给一个方案时不要输出 planB。
 
 ## 计划硬性规则
 - 默认 1-3 个镜头；只有用户明确要求多镜，才加到最多 6 个。不擅自加戏。
@@ -836,6 +840,8 @@ export interface AgentResult {
   reply: string;
   graph?: ComfyGraph;
   plan?: DramaPlan;
+  /** P1-3 双方案：与 plan 差异化的备选变体，确认门可一键切换 */
+  planAlt?: DramaPlan;
   run?: RunRecord;
   degraded?: boolean;
   error?: string;
@@ -1261,6 +1267,18 @@ export async function runAgentTurn(
     const { plan: finalPlan, warnings: budgetWarnings } = applyBudget(plan, opts.budget);
     for (const w of budgetWarnings) log("warn", w);
 
+    // P1-3 双方案：模型给了 planB 就一起接住（同 schema，预算同样裁一遍）
+    let planAlt: DramaPlan | undefined;
+    if (parsed?.planB) {
+      try {
+        const alt = parsePlan(parsed.planB);
+        planAlt = applyBudget(alt.plan, opts.budget).plan;
+        for (const w of alt.warnings) log("warn", w);
+      } catch (e) {
+        log("warn", `B 方案解析失败，忽略：${e}`);
+      }
+    }
+
     const stats = planStats(finalPlan);
     const withVideo = hasArkKey && finalPlan.mode === "video";
     cb.onStep?.({
@@ -1291,9 +1309,18 @@ export async function runAgentTurn(
         risk.verdict === "revise" || risk.verdict === "fail"
           ? `\n\n⚠️ 分镜风险${RISK_VERDICT_LABEL[risk.verdict]}（${risk.average}/5）：${risk.suggestions.join("；")}。可以直接说「改计划：…」让我重出。`
           : "";
+      // P1-3 双方案：B 版一并亮出来，确认卡上可一键切换
+      const altNote = planAlt
+        ? (() => {
+            const altStats = planStats(planAlt);
+            const altRisk = planRisk(planAlt);
+            return `\n\n另有 B 方案「${planAlt.title}」：${altStats.shots} 镜 · 约 ${altStats.seconds}s · 风险${RISK_VERDICT_LABEL[altRisk.verdict]}——确认卡上点「换另一版」可切换。`;
+          })()
+        : "";
       return done({
-        reply: `${reply}${riskNote}\n\n图已经搭到画布上了，看一眼；觉得对就点画布上的「开始生成」。`,
+        reply: `${reply}${riskNote}${altNote}\n\n图已经搭到画布上了，看一眼；觉得对就点画布上的「开始生成」。`,
         plan: finalPlan,
+        planAlt,
         append: parsed.append === true,
         degraded,
         needsConfirm: true,
