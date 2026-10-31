@@ -3,6 +3,7 @@ import { useStore } from "../lib/store";
 import { CanvasGraph } from "./CanvasGraph";
 import { mediaSrc } from "../lib/media";
 import { fmtCny, useCostEstimate, type CostEstimate } from "../lib/cost";
+import { planRisk, RISK_VERDICT_LABEL, RISK_VERDICT_TONE } from "../lib/planRisk";
 import type { Asset, DramaPlan, RunRecord, RunUsage } from "../types";
 import type { NodeRun } from "../lib/store";
 import { Btn, Empty, I, IconBtn, Spinner, Tag, cx } from "./ui";
@@ -278,6 +279,8 @@ function LivePlan({
   const runningNow = states.findIndex((x) => x.s === "run");
   const live = status === "running";
   const idleLabel = live ? "排队中" : status === "error" ? "没跑完" : "还没生成";
+  // P1-1 分镜风险：纯函数现算，不占存储
+  const risk = useMemo(() => planRisk(plan), [plan]);
 
   return (
     <section className="space-y-3 fade-in">
@@ -285,6 +288,9 @@ function LivePlan({
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
             <h2 className="truncate t-16 font-medium text-[var(--fg-1)]">{plan.title}</h2>
+            {!live ? (
+              <Tag tone={RISK_VERDICT_TONE[risk.verdict]}>风险{RISK_VERDICT_LABEL[risk.verdict]}</Tag>
+            ) : null}
             {live ? (
               <Tag tone="accent">生成中</Tag>
             ) : status === "error" ? (
@@ -326,6 +332,17 @@ function LivePlan({
         <p className="max-w-[720px] border-l-[1.5px] border-[var(--line-3)] pl-2.5 t-12 leading-[19px] text-[var(--fg-3)]">
           {plan.style}
         </p>
+      ) : null}
+
+      {/* P1-1：revise / fail 时把具体改法摆在确认门上，人在点「开始生成」前就能改 */}
+      {!live && risk.suggestions.length ? (
+        <ul className="max-w-[720px] space-y-1 rounded-[10px] bg-[var(--bg-1)] px-3 py-2 shadow-[inset_0_0_0_0.5px_var(--line-1)]">
+          {risk.suggestions.map((s, i) => (
+            <li key={i} className="t-12 leading-[19px] text-[var(--fg-3)]">
+              · {s}
+            </li>
+          ))}
+        </ul>
       ) : null}
 
       <div className="grid content-start gap-3 [grid-template-columns:repeat(auto-fill,minmax(168px,1fr))]">

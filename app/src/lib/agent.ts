@@ -11,6 +11,7 @@ import { llmChatStream } from "./api";
 import type { ComfyClient, WatchEvent } from "./comfy";
 import { BLOCKED_INDEX, NODES, NODE_INDEX, LIB_STATS, MISSING_CORE } from "./nodeSearch";
 import { applyBudget, buildRepairMessages, compilePlan, parsePlan, parseRepair, planStats } from "./plan";
+import { planRisk, RISK_VERDICT_LABEL } from "./planRisk";
 import type { Budget } from "./plan";
 import { applyGraphOps, buildGraphEditMessages } from "./graphOps";
 import { auditGraph, hasGenerator } from "./graphAudit";
@@ -1284,8 +1285,14 @@ export async function runAgentTurn(
 
     // 确认门：会花钱的执行都先停下来等用户点头
     if (hasArkKey && opts.confirmBeforeRun) {
+      // P1-1 分镜风险：revise / fail 就把具体改法说在回复里，也落到确认卡上
+      const risk = planRisk(finalPlan);
+      const riskNote =
+        risk.verdict === "revise" || risk.verdict === "fail"
+          ? `\n\n⚠️ 分镜风险${RISK_VERDICT_LABEL[risk.verdict]}（${risk.average}/5）：${risk.suggestions.join("；")}。可以直接说「改计划：…」让我重出。`
+          : "";
       return done({
-        reply: `${reply}\n\n图已经搭到画布上了，看一眼；觉得对就点画布上的「开始生成」。`,
+        reply: `${reply}${riskNote}\n\n图已经搭到画布上了，看一眼；觉得对就点画布上的「开始生成」。`,
         plan: finalPlan,
         append: parsed.append === true,
         degraded,
