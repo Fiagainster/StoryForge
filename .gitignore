@@ -20,3 +20,6 @@ Thumbs.db
 
 # 项目数据（用户创作内容，不进 git）
 projects/
+
+# WorkBuddy 协作数据（AI 工作日志/截图，本地保留不进库）
+.workbuddy/
