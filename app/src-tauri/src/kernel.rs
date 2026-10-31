@@ -176,6 +176,47 @@ fn join_prompt(parts: &[&str]) -> String {
         .join("。")
 }
 
+/// 视频提示词拼装（纯函数，可单测）。
+/// 吸收 Seedance 官方提示法（OpenMontage seedance-prompting skill）：
+///   - 台词用引用句式（口型以引号内字符串为准，别用叙述式"对镜头说"）；
+///   - generate_audio 时给一句贴合场景的声音方向（同步音频是 Seedance 的强项，
+///     但不给方向模型就会瞎配环境声）；
+///   - 运镜 / 动作 / 情绪各自成段，一句一拍。
+fn shot_video_prompt_parts(
+    camera_text: &str,
+    action: &str,
+    emotion: &str,
+    dialogue: &str,
+    location: &str,
+    generate_audio: bool,
+) -> Vec<String> {
+    let mut parts = vec![
+        format!("运镜：{camera_text}"),
+        action.trim().to_string(),
+    ];
+    if !emotion.trim().is_empty() {
+        parts.push(format!("情绪：{}", emotion.trim()));
+    }
+    if !dialogue.trim().is_empty() {
+        parts.push(format!(
+            "角色开口说（口型对准引号内台词）：「{}」",
+            dialogue.trim()
+        ));
+    }
+    if generate_audio {
+        if location.trim().is_empty() {
+            parts.push("声音：与画面同源的现场环境声与动作音效".to_string());
+        } else {
+            parts.push(format!(
+                "声音：{} 的现场环境声，动作音效与画面同步",
+                location.trim()
+            ));
+        }
+    }
+    parts.push("画面无文字无水印".to_string());
+    parts
+}
+
 // ---------------------------------------------------------------------------
 // 执行上下文
 // ---------------------------------------------------------------------------
@@ -1851,21 +1892,14 @@ async fn execute_node(
             let emotion = inp_str("emotion");
             let dialogue = inp_str("dialogue");
             let override_p = inp_str("prompt_override");
-            let common = [
-                format!("运镜：{camera_text}"),
-                action.trim().to_string(),
-                if emotion.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!("情绪：{}", emotion.trim())
-                },
-                if dialogue.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!("角色对镜头说：「{}」", dialogue.trim())
-                },
-                "画面无文字无水印".to_string(),
-            ];
+            let common = shot_video_prompt_parts(
+                &camera_text,
+                &action,
+                &emotion,
+                &dialogue,
+                &inp_str("location"),
+                inp_bool("generate_audio"),
+            );
             let prompt = if !override_p.trim().is_empty() {
                 override_p.trim().to_string()
             } else {
@@ -2543,6 +2577,37 @@ mod audit_tests {
         assert_eq!(parse_yavg("frame:0 pts:0\nlavfi.signalstats.YAVG=57.375000"), Some(57.375));
         assert_eq!(parse_yavg("no data here"), None);
         assert_eq!(parse_yavg("YAVG=0.0 later YAVG=12.5"), Some(12.5), "取最后一次");
+    }
+
+    #[test]
+    fn shot_video_prompt_lipsync_and_audio() {
+        // 台词走引用句式（唇形同步 key 引号内字符串），不再是叙述式"对镜头说"
+        let parts = shot_video_prompt_parts(
+            "镜头缓慢推近，逐渐收紧到人物",
+            "她把伞收起，甩了甩雨水",
+            "强忍泪水",
+            "你到底想说什么",
+            "雨夜便利店门口",
+            true,
+        );
+        let joined = parts.join("；");
+        assert!(
+            parts.iter().any(|p| p.contains("口型对准引号内台词") && p.contains("「你到底想说什么」")),
+            "台词必须引用句式：{joined}"
+        );
+        assert!(
+            parts.iter().any(|p| p.contains("雨夜便利店门口") && p.contains("环境声")),
+            "有 location 时声音方向要贴场景：{joined}"
+        );
+        assert!(parts.iter().any(|p| p.contains("画面无文字无水印")));
+
+        // 无台词 + 不生成音频：不出现声音段
+        let parts = shot_video_prompt_parts("固定机位", "她站着", "", "", "", false);
+        assert!(!parts.iter().any(|p| p.contains("声音")));
+
+        // 无 location 的兜底声音方向
+        let parts = shot_video_prompt_parts("固定机位", "她站着", "", "", "", true);
+        assert!(parts.iter().any(|p| p.contains("与画面同源")));
     }
 
     #[test]

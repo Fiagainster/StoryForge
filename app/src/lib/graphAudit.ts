@@ -177,10 +177,14 @@ export function auditGraph(graph: ComfyGraph, lookup?: AuditLookup): AuditIssue[
       const has = spec.k in (node.inputs || {});
       if (has) continue;
       if (spec.req) {
+        // CHAI Constructive：error 必须带具体修法，不许只说"不行"
+        const fix = spec.def !== undefined && spec.def !== ""
+          ? `在检查器里把 "${spec.k}" 填成默认值 ${JSON.stringify(spec.def)}，或从上游连线接过来`
+          : `从上游节点连线接到 "${spec.k}"（${spec.t} 类型）`;
         issues.push({
           level: "error",
           id,
-          text: `${visibleTitle(graph, id)} 的必填输入 "${spec.k}"（${spec.t}）没接`,
+          text: `${visibleTitle(graph, id)} 的必填输入 "${spec.k}"（${spec.t}）没接——${fix}`,
         });
       }
     }
@@ -190,7 +194,7 @@ export function auditGraph(graph: ComfyGraph, lookup?: AuditLookup): AuditIssue[
         issues.push({
           level: "error",
           id,
-          text: `${visibleTitle(graph, id)} 的 "${key}" 指向已删除的节点 ${v[0]}`,
+          text: `${visibleTitle(graph, id)} 的 "${key}" 指向已删除的节点 ${v[0]}——在画布上把这根线改接到现存节点，或删掉这个输入`,
         });
       }
     }
