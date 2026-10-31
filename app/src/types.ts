@@ -72,6 +72,8 @@ export interface RunUsage {
   llmTokens: number;
   images: number;
   videoSeconds: number;
+  /** P0-2 对账：这次执行实际花的钱（元，含自动重跑），内核估的 */
+  costCny?: number;
 }
 
 export type ShotSize =
@@ -185,7 +187,14 @@ export interface AppConfig {
   image: { model: string; size?: string };
   video: { model: string; resolution?: string; generateAudio?: boolean };
   /** 单次生成的预算上限：超出会被截断 */
-  budget: { maxShots: number; maxSeconds: number };
+  budget: {
+    maxShots: number;
+    maxSeconds: number;
+    /** P0-2 单次金额上限（元）；0 或缺省 = 不限 */
+    maxCny?: number;
+    /** P0-2 治理模式：observe 只显示 / warn 超限提醒 / cap 超限拦截 */
+    mode?: "observe" | "warn" | "cap";
+  };
   /** 自我完善：从失败修复中沉淀的经验，出计划时注入 */
   memory?: { learnings: string[] };
 }

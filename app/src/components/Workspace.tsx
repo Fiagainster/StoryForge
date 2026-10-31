@@ -2,6 +2,7 @@ import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "../lib/store";
 import { CanvasGraph } from "./CanvasGraph";
 import { mediaSrc } from "../lib/media";
+import { fmtCny, useCostEstimate, type CostEstimate } from "../lib/cost";
 import type { Asset, DramaPlan, RunRecord, RunUsage } from "../types";
 import type { NodeRun } from "../lib/store";
 import { Btn, Empty, I, IconBtn, Spinner, Tag, cx } from "./ui";
@@ -36,6 +37,7 @@ function usageText(u: RunUsage) {
   const parts = [`${u.images} 图`];
   if (u.videoSeconds) parts.push(`${u.videoSeconds}s 视频`);
   if (u.llmTokens) parts.push(`LLM ${fmt(u.llmTokens)}`);
+  if (u.costCny) parts.push(fmtCny(u.costCny));
   return parts.join(" · ");
 }
 
@@ -257,6 +259,7 @@ function LivePlan({
   status,
   runNodes,
   busy,
+  estimate,
   onRun,
   onStop,
 }: {
@@ -264,6 +267,7 @@ function LivePlan({
   status: "draft" | "running" | "done" | "error";
   runNodes: Record<string, NodeRun>;
   busy: boolean;
+  estimate: CostEstimate | null;
   onRun: () => void;
   onStop: () => void;
 }) {
@@ -291,6 +295,9 @@ function LivePlan({
           </div>
           <div className="mt-0.5 t-11 tabular text-[var(--fg-4)]">
             {plan.shots.length} 镜 · 约 {seconds}s
+            {estimate
+              ? ` · 预计 ${fmtCny(estimate.low)}（含重试缓冲至多 ${fmtCny(estimate.high)}）`
+              : ""}
             {live ? ` · 已完成 ${done}/${plan.shots.length}` : ""}
             {live && runningNow >= 0 ? ` · 正在跑第 ${runningNow + 1} 镜` : ""}
             {!live && errs ? ` · ${errs} 镜出错` : ""}
@@ -979,6 +986,10 @@ export function Workspace({ chatOpen, onOpenChat }: { chatOpen: boolean; onOpenC
   const [assetKind, setAssetKind] = useState<"all" | "image" | "video">("all");
 
   const latest = runs[0];
+  // P0-2：待生成的计划显示"预计 ¥X（含缓冲至多 ¥Y）"——估算同一张价格表在内核里
+  const estimate = useCostEstimate(
+    draft.plan && draft.status !== "running" ? draft.graph : null
+  );
   const allAssets = useMemo(
     () => runs.flatMap((r) => r.assets.map((a) => ({ ...a, runId: r.id }))),
     [runs]
@@ -990,9 +1001,10 @@ export function Workspace({ chatOpen, onOpenChat }: { chatOpen: boolean; onOpenC
         llmTokens: acc.llmTokens + u.llmTokens,
         images: acc.images + u.images,
         videoSeconds: Math.round((acc.videoSeconds + u.videoSeconds) * 10) / 10,
+        costCny: Math.round((acc.costCny + (u.costCny ?? 0)) * 100) / 100,
       };
     },
-    { llmTokens: 0, images: 0, videoSeconds: 0 }
+    { llmTokens: 0, images: 0, videoSeconds: 0, costCny: 0 }
   );
 
   const openZoom = (a: Asset, list: Asset[]) => {
@@ -1165,6 +1177,7 @@ export function Workspace({ chatOpen, onOpenChat }: { chatOpen: boolean; onOpenC
                     status={draft.status}
                     runNodes={runNodes}
                     busy={busy}
+                    estimate={estimate}
                     onRun={() => void runDraft()}
                     onStop={() => void cancelRun()}
                   />
@@ -1252,6 +1265,7 @@ export function Workspace({ chatOpen, onOpenChat }: { chatOpen: boolean; onOpenC
               {runs.length > 0 ? (
                 <div className="mb-5 grid gap-2.5 [grid-template-columns:repeat(auto-fit,minmax(150px,1fr))]">
                   <Stat label="累计用量" value={usageText(totalUsage)} />
+                  <Stat label="花费" value={totalUsage.costCny ? fmtCny(totalUsage.costCny) : "—"} />
                   <Stat label="执行次数" value={`${runs.length} 次`} />
                   <Stat label="文件" value={`${allAssets.length} 个`} />
                   <Stat

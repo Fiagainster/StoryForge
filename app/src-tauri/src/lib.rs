@@ -1063,7 +1063,28 @@ fn kernel_submit_cmd(
         .ok_or("找不到 ffmpeg（占位图 / 缩放 / 尾帧都靠它）。请把 ffmpeg.exe 放进项目根的 bin/ 文件夹，或重新安装完整版。")?;
     let ffprobe = kernel::find_tool(&tool_candidates(&app), &root, "ffprobe").unwrap_or(ffmpeg.clone());
 
-    kernel::kernel_submit(app, graph, client_id, out_dir.to_string_lossy().to_string(), prompts_dir.to_string_lossy().to_string(), ark_key, ffmpeg.to_string_lossy().to_string(), ffprobe.to_string_lossy().to_string())
+    // P0-2 预算治理：单次金额上限 + 模式（observe=只显示 / warn=超限提醒 / cap=超限拦截）
+    let (budget_limit, budget_mode) = {
+        let b = &cfg["budget"];
+        (
+            b["maxCny"].as_f64().unwrap_or(0.0),
+            b["mode"].as_str().unwrap_or("observe").to_string(),
+        )
+    };
+
+    kernel::kernel_submit(app, graph, client_id, out_dir.to_string_lossy().to_string(), prompts_dir.to_string_lossy().to_string(), ark_key, ffmpeg.to_string_lossy().to_string(), ffprobe.to_string_lossy().to_string(), budget_limit, budget_mode)
+}
+
+/// P0-2：整图成本估算（元）。确认门在提交前调这个，显示"预计 ¥X（含缓冲至多 ¥Y）"。
+#[tauri::command]
+fn estimate_cost_cmd(graph: Value) -> Result<Value, String> {
+    let est = kernel::estimate_graph_cost(&graph)?;
+    let r2 = |x: f64| (x * 100.0).round() / 100.0;
+    Ok(serde_json::json!({
+        "low": r2(est),
+        "high": r2(est * kernel::COST_RETRY_BUFFER),
+        "currency": "CNY",
+    }))
 }
 
 #[tauri::command]
@@ -1096,6 +1117,7 @@ pub fn run() {
             comfy_output_list,
             comfy_output_trash,
             kernel_submit_cmd,
+            estimate_cost_cmd,
             kernel::kernel_history,
             kernel::kernel_interrupt,
             llm_chat,

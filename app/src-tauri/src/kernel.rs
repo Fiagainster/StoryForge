@@ -56,15 +56,24 @@ struct RunInfo {
     status: Mutex<String>, // running / success / error
     outputs: Mutex<Value>, // nodeId → { images: [...], videos: [...] }
     error: Mutex<String>,
+    /// P0-2 成本对账：估算（一次成功）在提交时定死；实际含自动重跑，逐次累加
+    cost_est: f64,
+    cost_actual: Mutex<f64>,
+    budget_limit: f64,
+    budget_mode: String,
 }
 
 impl RunInfo {
-    fn new() -> Self {
+    fn new(cost_est: f64, budget_limit: f64, budget_mode: String) -> Self {
         Self {
             cancel: AtomicBool::new(false),
             status: Mutex::new("running".into()),
             outputs: Mutex::new(json!({})),
             error: Mutex::new(String::new()),
+            cost_est,
+            cost_actual: Mutex::new(0.0),
+            budget_limit,
+            budget_mode,
         }
     }
     fn cancelled(&self) -> bool {
@@ -993,6 +1002,114 @@ fn audit_node_outputs(
 }
 
 // ---------------------------------------------------------------------------
+// P0-2 成本估算：ARK 官方价（2026-10 官网查证），单镜单价 × 镜头数 × 重试缓冲。
+// 价格来源：火山方舟模型价格页；Seedance token 公式折算成元/秒（官方示例价 720p 16:9
+// 5s = ¥7.56 → ¥1.51/s；各宽高比像素面积基本一致，按分辨率取档）。
+// ---------------------------------------------------------------------------
+
+/// Seedream 输出图单价（元/张）：单图生成 ≤261 万像素档；超档翻倍
+const SEEDREAM_PIXEL_TIER: u64 = 2_610_000;
+const SEEDREAM_PRO_CNY: f64 = 0.30;
+const SEEDREAM_PRO_HI_CNY: f64 = 0.60;
+/// 每张输入参考图加收
+const SEEDREAM_REF_CNY: f64 = 0.02;
+
+/// Seedance 输出单价（元/秒，输入不含视频；480p/720p/1080p）
+const SEEDANCE_CNY_PER_SEC: &[(&str, f64)] = &[("480p", 0.67), ("720p", 1.51), ("1080p", 3.74)];
+/// duration=-1（自动时长）时的估算时长
+const SEEDANCE_AUTO_DURATION_S: f64 = 15.0;
+/// 重试缓冲（学 OpenMontage cost_tracker 的 1.3x）：估算区间 [一次成功, ×1.3]
+pub const COST_RETRY_BUFFER: f64 = 1.3;
+
+/// Seedream 单张成本（元）
+fn image_unit_cost(model: &str, size: &str, ref_count: usize) -> f64 {
+    let dims: Vec<u64> = size
+        .split(['x', 'X', '*'])
+        .filter_map(|s| s.trim().parse::<u64>().ok())
+        .collect();
+    let px = if dims.len() == 2 { dims[0].saturating_mul(dims[1]) } else { 0 };
+    let base = if model.contains("5-0-flash") {
+        0.12
+    } else if model.contains("5-0-lite") {
+        0.22
+    } else if model.contains("4-5") {
+        0.25
+    } else if model.contains("4-0") {
+        0.20
+    } else if px > SEEDREAM_PIXEL_TIER {
+        SEEDREAM_PRO_HI_CNY
+    } else {
+        SEEDREAM_PRO_CNY
+    };
+    base + SEEDREAM_REF_CNY * ref_count as f64
+}
+
+/// Seedance 单条视频成本（元）
+fn video_unit_cost(model: &str, resolution: &str, duration: i64) -> f64 {
+    let per_sec = SEEDANCE_CNY_PER_SEC
+        .iter()
+        .find(|(r, _)| *r == resolution.trim())
+        .map(|(_, p)| *p)
+        .unwrap_or(1.51);
+    // fast / mini 档按 token 单价比例打折（37/46 与 23/46）
+    let tier = if model.contains("fast") {
+        0.8
+    } else if model.contains("mini") {
+        0.5
+    } else {
+        1.0
+    };
+    let secs = if duration <= 0 { SEEDANCE_AUTO_DURATION_S } else { duration as f64 };
+    per_sec * tier * secs
+}
+
+/// 单节点成本（元）；本地 ffmpeg 节点 0 元
+fn node_unit_cost(def: &NodeDef) -> f64 {
+    let model = || {
+        def.inputs
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let ref_count = |keys: &[&str]| -> usize {
+        keys.iter()
+            .filter(|k| def.inputs.get(**k).map(is_link).unwrap_or(false))
+            .count()
+    };
+    match def.class_type.as_str() {
+        "DramaCharacter" => {
+            let size = def.inputs.get("size").and_then(|v| v.as_str()).unwrap_or("");
+            image_unit_cost(&model(), size, 0)
+        }
+        "DramaShotFrame" => {
+            let size = def.inputs.get("size").and_then(|v| v.as_str()).unwrap_or("");
+            image_unit_cost(
+                &model(),
+                size,
+                ref_count(&["character1", "character2", "character3", "previous_frame"]),
+            )
+        }
+        "StoryForgeSeedream" => {
+            let size = def.inputs.get("size").and_then(|v| v.as_str()).unwrap_or("");
+            image_unit_cost(&model(), size, ref_count(&["character1", "character2", "character3"]))
+        }
+        "DramaShotVideo" | "StoryForgeSeedance" => {
+            let resolution = def.inputs.get("resolution").and_then(|v| v.as_str()).unwrap_or("720p");
+            let duration = def.inputs.get("duration").and_then(|v| v.as_i64()).unwrap_or(5);
+            video_unit_cost(&model(), resolution, duration)
+        }
+        _ => 0.0,
+    }
+}
+
+/// 整图估算（元，一次成功的理想值）；不可解析的图直接报错
+pub fn estimate_graph_cost(graph: &Value) -> Result<f64, String> {
+    let nodes = parse_graph(graph)?;
+    Ok(nodes.values().map(node_unit_cost).sum())
+}
+
+// ---------------------------------------------------------------------------
 // 图执行器
 // ---------------------------------------------------------------------------
 
@@ -1590,6 +1707,7 @@ fn next_counter(dir: &Path, base: &str, ext: &str) -> u32 {
 
 /// 提交一张图给内核执行。校验通过立刻返回 prompt_id，执行在后台异步进行，
 /// 进度走 `kernel://event`，结果查 kernel_history。
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub fn kernel_submit(
     app: AppHandle,
@@ -1600,12 +1718,23 @@ pub fn kernel_submit(
     ark_key: String,
     ffmpeg: String,
     ffprobe: String,
+    budget_limit: f64,
+    budget_mode: String,
 ) -> Result<Value, String> {
     let nodes = parse_graph(&graph)?;
     let order = topo_order(&nodes)?;
 
+    // P0-2 预算治理：cap 模式下估算（含重试缓冲）超限直接拒收，一个请求都不发
+    let est = nodes.values().map(node_unit_cost).sum::<f64>();
+    if budget_mode == "cap" && budget_limit > 0.0 && est * COST_RETRY_BUFFER > budget_limit {
+        return Err(format!(
+            "预算拦截（cap 模式）：预计 ¥{est:.2}、含重试缓冲至多 ¥{:.2}，超过单次上限 ¥{budget_limit:.2}。可到「设置 → 预算」调高上限，或改成提醒模式。",
+            est * COST_RETRY_BUFFER
+        ));
+    }
+
     let prompt_id = new_prompt_id();
-    let run = Arc::new(RunInfo::new());
+    let run = Arc::new(RunInfo::new(est, budget_limit, budget_mode.clone()));
     runs().lock().unwrap().insert(prompt_id.clone(), run.clone());
 
     let http = reqwest::Client::builder()
@@ -1635,6 +1764,19 @@ pub fn kernel_submit(
         let _ = std::fs::create_dir_all(&ctx.out_dir);
         let _ = std::fs::create_dir_all(&ctx.tmp_dir);
         ctx.emit(json!({ "type": "execution_start" }));
+        // P0-2 warn 模式：超限不拦，但开跑前明说
+        if ctx.run.budget_mode == "warn"
+            && ctx.run.budget_limit > 0.0
+            && ctx.run.cost_est * COST_RETRY_BUFFER > ctx.run.budget_limit
+        {
+            ctx.emit(json!({
+                "type": "progress",
+                "detail": format!(
+                    "预算提醒：预计 ¥{:.2}、含重试缓冲至多 ¥{:.2}，超过单次上限 ¥{:.2}（warn 模式只提醒不拦截）",
+                    ctx.run.cost_est, ctx.run.cost_est * COST_RETRY_BUFFER, ctx.run.budget_limit
+                ),
+            }));
+        }
         let mut produced: HashMap<String, Vec<NodeVal>> = HashMap::new();
         let mut assets_counter: u64 = 0;
         let result: Result<(), String> = async {
@@ -1656,6 +1798,8 @@ pub fn kernel_submit(
                     if AUDIT_GEN_NODES.contains(&def.class_type.as_str()) {
                         let mut attempt: u32 = 0;
                         loop {
+                            // P0-2 对账：每跑一次（首跑 + 重跑）记一次钱
+                            *ctx.run.cost_actual.lock().unwrap() += node_unit_cost(def);
                             let audit = audit_node_outputs(
                                 &ctx.ffmpeg,
                                 &ctx.ffprobe,
@@ -1749,6 +1893,17 @@ pub fn kernel_history(prompt_id: String) -> Value {
                 }),
             );
             entry.insert("outputs".into(), r.outputs.lock().unwrap().clone());
+            // P0-2 成本对账：估算 / 含缓冲上限 / 实际（含自动重跑）/ 上限与模式
+            entry.insert(
+                "cost".into(),
+                json!({
+                    "estimated": (r.cost_est * 100.0).round() / 100.0,
+                    "buffered": (r.cost_est * COST_RETRY_BUFFER * 100.0).round() / 100.0,
+                    "actual": (*r.cost_actual.lock().unwrap() * 100.0).round() / 100.0,
+                    "limit": r.budget_limit,
+                    "mode": r.budget_mode,
+                }),
+            );
             let err = r.error.lock().unwrap().clone();
             if !err.is_empty() {
                 entry.insert("error".into(), json!(err));
@@ -1929,5 +2084,37 @@ mod audit_tests {
         assert_eq!(parse_yavg("frame:0 pts:0\nlavfi.signalstats.YAVG=57.375000"), Some(57.375));
         assert_eq!(parse_yavg("no data here"), None);
         assert_eq!(parse_yavg("YAVG=0.0 later YAVG=12.5"), Some(12.5), "取最后一次");
+    }
+
+    #[test]
+    fn pricing_rules() {
+        // Seedream 5.0 pro：1080x1920（207 万像素 ≤ 261 万）→ 0.30；超档 → 0.60
+        assert!((image_unit_cost("doubao-seedream-5-0-pro-260628", "1080x1920", 0) - 0.30).abs() < 1e-9);
+        assert!((image_unit_cost("doubao-seedream-5-0-pro-260628", "2560x1440", 0) - 0.60).abs() < 1e-9);
+        // flash 0.12；参考图每张 +0.02
+        assert!((image_unit_cost("doubao-seedream-5-0-flash-260915", "1080x1920", 3) - 0.18).abs() < 1e-9);
+        // Seedance 720p 5s = 1.51 × 5 = 7.55（官方示例 7.56 是官方那头四舍五入）
+        assert!((video_unit_cost("doubao-seedance-2-5-260628", "720p", 5) - 7.55).abs() < 1e-9);
+        // duration=-1 按自动时长 15s 估
+        assert!((video_unit_cost("doubao-seedance-2-5-260628", "1080p", -1) - 3.74 * 15.0).abs() < 1e-9);
+        // mini 档按 token 单价比例打 5 折
+        assert!((video_unit_cost("doubao-seedance-2-0-mini-260615", "720p", 5) - 7.55 * 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn graph_cost_sums_gen_nodes_only() {
+        // 1 张 Seedream 图 + 1 条 Seedance 720p 5s + 本地节点 0 元
+        let g: Value = serde_json::from_str(
+            r#"{
+                "1": {"class_type": "StoryForgeSeedream", "inputs": {"prompt": "x", "model": "doubao-seedream-5-0-pro-260628", "size": "1080x1920"}},
+                "2": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}},
+                "3": {"class_type": "StoryForgeSeedance", "inputs": {"prompt": "x", "model": "doubao-seedance-2-5-260628", "duration": 5, "resolution": "720p"}},
+                "4": {"class_type": "SaveVideo", "inputs": {"video": ["3", 0]}},
+                "5": {"class_type": "EmptyImage", "inputs": {"width": 720, "height": 1280}}
+            }"#,
+        )
+        .unwrap();
+        let est = estimate_graph_cost(&g).unwrap();
+        assert!((est - (0.30 + 7.55)).abs() < 1e-9, "est = {est}");
     }
 }

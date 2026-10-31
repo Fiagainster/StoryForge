@@ -7,6 +7,14 @@ export interface HistoryEntry {
   status?: { status_str?: string; completed?: boolean; messages?: unknown[] };
   /** 内核执行失败的原因（对齐 ComfyUI 的 exception_message 位） */
   error?: string;
+  /** P0-2 成本对账：估算 / 含缓冲 / 实际（元） / 预算上限与模式 */
+  cost?: {
+    estimated: number;
+    buffered: number;
+    actual: number;
+    limit: number;
+    mode: string;
+  };
 }
 
 /** 执行进度事件：内核的 `kernel://event` 推什么，这里就翻成什么 */
@@ -180,7 +188,7 @@ export class ComfyClient {
     promptId: string,
     onTick?: (elapsedMs: number) => void,
     timeoutMs = 60 * 60 * 1000
-  ): Promise<Asset[]> {
+  ): Promise<{ assets: Asset[]; cost?: HistoryEntry["cost"] }> {
     const started = Date.now();
     while (Date.now() - started < timeoutMs) {
       const entry = await this.history(promptId);
@@ -190,8 +198,8 @@ export class ComfyClient {
           throw new Error(entry.error || "执行失败");
         }
         const assets = this.collectAssets(entry.outputs);
-        if (assets.length > 0) return assets;
-        if (entry.status?.completed) return [];
+        if (assets.length > 0) return { assets, cost: entry.cost };
+        if (entry.status?.completed) return { assets: [], cost: entry.cost };
       }
       onTick?.(Date.now() - started);
       await sleep(700);

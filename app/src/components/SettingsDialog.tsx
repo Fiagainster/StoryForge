@@ -18,6 +18,8 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const [genAudio, setGenAudio] = useState(true);
   const [maxShots, setMaxShots] = useState("3");
   const [maxSeconds, setMaxSeconds] = useState("30");
+  const [maxCny, setMaxCny] = useState("");
+  const [costMode, setCostMode] = useState<"observe" | "warn" | "cap">("observe");
   const [root, setRoot] = useState("");
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -36,6 +38,8 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
     setGenAudio(config.video?.generateAudio !== false);
     setMaxShots(String(config.budget?.maxShots ?? 3));
     setMaxSeconds(String(config.budget?.maxSeconds ?? 30));
+    setMaxCny(config.budget?.maxCny ? String(config.budget.maxCny) : "");
+    setCostMode(config.budget?.mode ?? "observe");
   }, [config]);
 
   const buildPatch = () =>
@@ -48,6 +52,8 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
       budget: {
         maxShots: Math.max(1, Number(maxShots) || 3),
         maxSeconds: Math.max(4, Number(maxSeconds) || 30),
+        maxCny: Math.max(0, Number(maxCny) || 0),
+        mode: costMode,
       },
     }) as any;
 
@@ -247,9 +253,31 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                   className="field tabular"
                 />
               </Field>
+              <Field label="单次金额上限（元）" hint="留空或 0 = 不限">
+                <input
+                  value={maxCny}
+                  onChange={(e) => setMaxCny(e.target.value)}
+                  inputMode="decimal"
+                  placeholder="不限"
+                  className="field tabular"
+                />
+              </Field>
+              <Field label="超限处理">
+                <select
+                  value={costMode}
+                  onChange={(e) => setCostMode(e.target.value as "observe" | "warn" | "cap")}
+                  className="field"
+                >
+                  <option value="observe">只显示（observe）</option>
+                  <option value="warn">提醒但放行（warn）</option>
+                  <option value="cap">拦截执行（cap）</option>
+                </select>
+              </Field>
             </div>
             <p className="t-11 leading-[17px] text-[var(--fg-4)]">
-              出计划后先等你确认；确认时超过上限的镜头会被截掉，不会静默烧额度。
+              出计划后先等你确认；确认时超过上限的镜头会被截掉，不会静默烧额度。金额按 ARK
+              官方价估算（Seedream 按张、Seedance 按秒），确认门显示区间，cap
+              模式下含重试缓冲超限会被拦下。
             </p>
           </Section>
 

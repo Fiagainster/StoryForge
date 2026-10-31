@@ -306,20 +306,26 @@ async function submitAndWait(
   const promptId = await client.queuePrompt(graph, clientId);
   log("info", `已提交执行，prompt_id=${promptId}`);
   let assets: Asset[] = [];
+  let cost: { estimated: number; buffered: number; actual: number } | undefined;
   try {
-    assets = await client.waitForPrompt(promptId, (elapsed) => {
+    ({ assets, cost } = await client.waitForPrompt(promptId, (elapsed) => {
       if (elapsed > 0 && Math.floor(elapsed / 5000) !== Math.floor((elapsed - 700) / 5000)) {
         log("info", `生成中… ${Math.round(elapsed / 1000)}s`);
       }
-    });
+    }));
   } finally {
     stopWatch();
     closeShot();
   }
   const usage = usageFromAssets(assets, llmTokens);
+  if (cost) usage.costCny = Math.round(cost.actual * 100) / 100;
   log(
     "info",
-    `完成，产出 ${assets.length} 个文件（${usage.images} 图 · ${usage.videoSeconds}s 视频 · LLM ${usage.llmTokens} tokens）`
+    `完成，产出 ${assets.length} 个文件（${usage.images} 图 · ${usage.videoSeconds}s 视频 · LLM ${usage.llmTokens} tokens）${
+      cost
+        ? ` · 实际 ¥${usage.costCny?.toFixed(2)}（预估 ¥${cost.estimated.toFixed(2)}，含重试缓冲至多 ¥${cost.buffered.toFixed(2)}）`
+        : ""
+    }`
   );
   return {
     id: promptId.slice(0, 8),
