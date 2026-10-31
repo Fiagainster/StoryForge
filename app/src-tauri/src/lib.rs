@@ -1080,6 +1080,58 @@ fn kernel_submit_cmd(
     kernel::kernel_submit(app, graph, client_id, out_dir.to_string_lossy().to_string(), prompts_dir.to_string_lossy().to_string(), ark_key, ffmpeg.to_string_lossy().to_string(), ffprobe.to_string_lossy().to_string(), budget_limit, budget_mode, video_provider, jimeng_ak, jimeng_sk)
 }
 
+/// P2 多平台导出：把产物目录里的视频裁成另一比例（16:9 横版 / 9:16 竖版）。
+/// 只允许裁 output/ 目录下的文件——路径从 filename+subfolder 在后端拼，前端不给传路径。
+#[tauri::command]
+fn export_aspect_cmd(
+    app: tauri::AppHandle,
+    filename: String,
+    subfolder: Option<String>,
+    aspect: String,
+) -> Result<Value, String> {
+    if filename.contains("..") || filename.contains('/') || filename.contains('\\') {
+        return Err("非法文件名".into());
+    }
+    let cfg = load_config(&app);
+    let root = detect_root(&cfg);
+    let workspace = resolve(&cfg, &root, "comfyBase");
+    let out_dir = workspace.join("output");
+    let mut src = out_dir.clone();
+    if let Some(sf) = subfolder.as_deref() {
+        if !sf.trim().is_empty() && sf.contains("..") {
+            return Err("非法子目录".into());
+        }
+        src.push(sf.trim().trim_start_matches(['/', '\\']));
+    }
+    src.push(&filename);
+    if !src.is_file() {
+        return Err(format!("找不到产物文件 {}", src.display()));
+    }
+    let ffmpeg = kernel::find_tool(&tool_candidates(&app), &root, "ffmpeg")
+        .ok_or("找不到 ffmpeg")?;
+    let ffprobe =
+        kernel::find_tool(&tool_candidates(&app), &root, "ffprobe").unwrap_or(ffmpeg.clone());
+    let stem = src
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("clip")
+        .to_string();
+    let tag = aspect.replace(':', "x");
+    let out = src.with_file_name(format!("{stem}_{tag}.mp4"));
+    kernel::export_aspect(
+        &ffmpeg,
+        &ffprobe,
+        src.to_str().ok_or("路径含非法字符")?,
+        &aspect,
+        out.to_str().ok_or("路径含非法字符")?,
+    )?;
+    Ok(serde_json::json!({
+        "path": out.to_string_lossy(),
+        "filename": out.file_name().and_then(|s| s.to_str()).unwrap_or(""),
+        "subfolder": subfolder.unwrap_or_default(),
+    }))
+}
+
 /// P0-2：整图成本估算（元）。确认门在提交前调这个，显示"预计 ¥X（含缓冲至多 ¥Y）"。
 #[tauri::command]
 fn estimate_cost_cmd(app: tauri::AppHandle, graph: Value) -> Result<Value, String> {
@@ -1125,6 +1177,7 @@ pub fn run() {
             comfy_output_trash,
             kernel_submit_cmd,
             estimate_cost_cmd,
+            export_aspect_cmd,
             kernel::kernel_history,
             kernel::kernel_interrupt,
             llm_chat,

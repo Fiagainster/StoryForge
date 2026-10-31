@@ -1,4 +1,5 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { useStore } from "../lib/store";
 import { CanvasGraph } from "./CanvasGraph";
 import { mediaSrc } from "../lib/media";
@@ -1065,6 +1066,28 @@ export function Workspace({ chatOpen, onOpenChat }: { chatOpen: boolean; onOpenC
   const wheelLock = useRef(0);
   useEffect(() => setFit(true), [current?.filename]);
 
+  /** P2 多平台导出：灯箱里一键把竖屏成片裁成 16:9 横版（居中裁切，另存新文件） */
+  const [exporting, setExporting] = useState(false);
+  const isVideoAsset =
+    !!current &&
+    (current.kind === "video" || /\.(mp4|webm|mov|mkv)(?:[?&#]|$)/i.test(current.filename));
+  const exportLandscape = async () => {
+    if (!current || exporting) return;
+    setExporting(true);
+    try {
+      const r = await invoke<{ path: string }>("export_aspect_cmd", {
+        filename: current.filename,
+        subfolder: current.subfolder || null,
+        aspect: "16:9",
+      });
+      useStore.getState().addLog("info", `已导出 16:9 横版：${r.path}`);
+    } catch (e) {
+      useStore.getState().addLog("error", `导出 16:9 失败：${e}`);
+    } finally {
+      setExporting(false);
+    }
+  };
+
   /** 画布上这一版还没执行完/还没执行：分镜页顶上摆一个跟着跑的版本 */
   const needsLive = !!draft.plan && draft.status !== "done";
 
@@ -1514,6 +1537,20 @@ export function Workspace({ chatOpen, onOpenChat }: { chatOpen: boolean; onOpenC
             >
               {fit ? "1:1 原始大小" : "适应窗口"}
             </Btn>
+            {isVideoAsset ? (
+              <Btn
+                size="xs"
+                variant="ghost"
+                disabled={exporting}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void exportLandscape();
+                }}
+                title="居中裁切成 16:9 横版，另存到同目录（不覆盖原片）"
+              >
+                {exporting ? "导出中…" : "导出 16:9 横版"}
+              </Btn>
+            ) : null}
             <IconBtn label="关闭 (Esc)" onClick={() => setZoom(null)}>
               {I.close(14)}
             </IconBtn>

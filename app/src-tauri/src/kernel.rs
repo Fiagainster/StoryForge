@@ -723,6 +723,48 @@ pub fn ffmpeg_concat(ffmpeg: &Path, inputs: &[PathBuf], out_path: &Path) -> Resu
     result
 }
 
+/// P2 多平台导出：按目标比例对成片做居中裁切（ffmpeg，crf 18 重编码，音轨直拷）。
+/// 9:16 竖屏 → 16:9 横版（全宽裁高）；16:9 → 9:16 反向。已经是目标比例就拒绝空转。
+pub fn export_aspect(
+    ffmpeg: &Path,
+    ffprobe: &Path,
+    input: &str,
+    aspect: &str,
+    out_path: &str,
+) -> Result<(), String> {
+    // 先看源片比例：目标 ≈ 现状就别浪费一轮编码
+    if let Some((w, h)) = ffprobe_streams(ffprobe, Path::new(input))
+        .and_then(|(w, h, _, _)| w.zip(h))
+        .filter(|(w, h)| *w > 0 && *h > 0)
+    {
+        let src_ratio = w as f64 / h as f64;
+        let target_ratio = match aspect {
+            "16:9" => 16.0 / 9.0,
+            "9:16" => 9.0 / 16.0,
+            _ => return Err(format!("不支持的比例 {aspect}（目前 16:9 / 9:16）")),
+        };
+        if (src_ratio - target_ratio).abs() / target_ratio < 0.05 {
+            return Err(format!("这个片子已经是 {aspect} 左右的比例，不用再导"));
+        }
+    }
+    // 居中裁切：宽高都取偶（libx264 yuv420p 要求）；高/宽按目标比例从源边推算
+    let vf = match aspect {
+        "16:9" => "crop=trunc(iw/2)*2:trunc(iw*9/16/2)*2",
+        "9:16" => "crop=trunc(ih*9/16/2)*2:trunc(ih/2)*2",
+        _ => return Err(format!("不支持的比例 {aspect}")),
+    };
+    run_ffmpeg(
+        ffmpeg,
+        &[
+            "-y", "-i", input,
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+            "-pix_fmt", "yuv420p", "-c:a", "copy",
+            out_path,
+        ],
+    )
+}
+
 // ---------------------------------------------------------------------------
 // P0-1 产物自审：生成节点出产物后立即质检，不合格自动重跑（最多 2 轮，
 // 学 OpenMontage reviewer 协议的"revise 最多 2 轮后 pass with warnings"，防无限烧钱）
@@ -1196,6 +1238,9 @@ struct VideoReq {
 
 type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
+// name/capabilities/estimate_cny 是 Provider 契约面：路由、计价与 UI 汇报共用，
+// 当前生产路径只走 generate_video，其余留给多供应商扩展与测试
+#[allow(dead_code)]
 trait VideoProvider: Send + Sync {
     fn name(&self) -> &'static str;
     /// 支持的输入能力；节点要求超出能力时由路由回落 ARK
