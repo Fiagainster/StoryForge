@@ -1,6 +1,6 @@
 [package]
 name = "storyforge"
-version = "0.2.0"
+version = "0.3.0"
 description = "StoryForge - 对话驱动的 AI 短剧工作台"
 edition = "2021"
 rust-version = "1.77"
