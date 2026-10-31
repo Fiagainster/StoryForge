@@ -185,7 +185,15 @@ export interface AppConfig {
   llm: { baseUrl: string; apiKey: string; model: string };
   ark: { apiKey: string };
   image: { model: string; size?: string };
-  video: { model: string; resolution?: string; generateAudio?: boolean };
+  video: {
+    model: string;
+    resolution?: string;
+    generateAudio?: boolean;
+    /** P1-2 视频供应商：ark（默认）/ jimeng（即梦，火山 CV，AK/SK） */
+    provider?: "ark" | "jimeng";
+  };
+  /** P1-2 即梦凭据（火山 IAM Access Key） */
+  jimeng?: { accessKey: string; secretKey: string };
   /** 单次生成的预算上限：超出会被截断 */
   budget: {
     maxShots: number;

@@ -1072,13 +1072,20 @@ fn kernel_submit_cmd(
         )
     };
 
-    kernel::kernel_submit(app, graph, client_id, out_dir.to_string_lossy().to_string(), prompts_dir.to_string_lossy().to_string(), ark_key, ffmpeg.to_string_lossy().to_string(), ffprobe.to_string_lossy().to_string(), budget_limit, budget_mode)
+    // P1-2 视频 Provider：ark（默认）/ jimeng（火山 CV，AK/SK）
+    let video_provider = cfg["video"]["provider"].as_str().unwrap_or("ark").to_string();
+    let jimeng_ak = cfg["jimeng"]["accessKey"].as_str().unwrap_or("").to_string();
+    let jimeng_sk = cfg["jimeng"]["secretKey"].as_str().unwrap_or("").to_string();
+
+    kernel::kernel_submit(app, graph, client_id, out_dir.to_string_lossy().to_string(), prompts_dir.to_string_lossy().to_string(), ark_key, ffmpeg.to_string_lossy().to_string(), ffprobe.to_string_lossy().to_string(), budget_limit, budget_mode, video_provider, jimeng_ak, jimeng_sk)
 }
 
 /// P0-2：整图成本估算（元）。确认门在提交前调这个，显示"预计 ¥X（含缓冲至多 ¥Y）"。
 #[tauri::command]
-fn estimate_cost_cmd(graph: Value) -> Result<Value, String> {
-    let est = kernel::estimate_graph_cost(&graph)?;
+fn estimate_cost_cmd(app: tauri::AppHandle, graph: Value) -> Result<Value, String> {
+    let cfg = load_config(&app);
+    let provider = cfg["video"]["provider"].as_str().unwrap_or("ark").to_string();
+    let est = kernel::estimate_graph_cost(&graph, &provider)?;
     let r2 = |x: f64| (x * 100.0).round() / 100.0;
     Ok(serde_json::json!({
         "low": r2(est),

@@ -16,6 +16,9 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const [arkKey, setArkKey] = useState("");
   const [resolution, setResolution] = useState("720p");
   const [genAudio, setGenAudio] = useState(true);
+  const [videoProvider, setVideoProvider] = useState<"ark" | "jimeng">("ark");
+  const [jimengAk, setJimengAk] = useState("");
+  const [jimengSk, setJimengSk] = useState("");
   const [maxShots, setMaxShots] = useState("3");
   const [maxSeconds, setMaxSeconds] = useState("30");
   const [maxCny, setMaxCny] = useState("");
@@ -35,6 +38,9 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
     setVideoModel(config.video?.model || "");
     setArkKey(config.ark?.apiKey || "");
     setResolution(config.video?.resolution || "720p");
+    setVideoProvider(config.video?.provider ?? "ark");
+    setJimengAk(config.jimeng?.accessKey || "");
+    setJimengSk(config.jimeng?.secretKey || "");
     setGenAudio(config.video?.generateAudio !== false);
     setMaxShots(String(config.budget?.maxShots ?? 3));
     setMaxSeconds(String(config.budget?.maxSeconds ?? 30));
@@ -48,7 +54,8 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
       llm: { baseUrl, apiKey, model },
       ark: { apiKey: arkKey },
       image: { model: imageModel },
-      video: { model: videoModel, resolution, generateAudio: genAudio },
+      video: { model: videoModel, resolution, generateAudio: genAudio, provider: videoProvider },
+      jimeng: { accessKey: jimengAk, secretKey: jimengSk },
       budget: {
         maxShots: Math.max(1, Number(maxShots) || 3),
         maxSeconds: Math.max(4, Number(maxSeconds) || 30),
@@ -210,6 +217,16 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
               </Field>
             </div>
             <div className="grid grid-cols-2 gap-3">
+              <Field label="视频供应商">
+                <select
+                  value={videoProvider}
+                  onChange={(e) => setVideoProvider(e.target.value as "ark" | "jimeng")}
+                  className="field"
+                >
+                  <option value="ark">火山 ARK · Seedance（默认）</option>
+                  <option value="jimeng">即梦 · 火山 CV（AK/SK）</option>
+                </select>
+              </Field>
               <Field label="视频分辨率">
                 <select
                   value={resolution}
@@ -233,6 +250,31 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                 </label>
               </Field>
             </div>
+            {videoProvider === "jimeng" ? (
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="即梦 Access Key">
+                  <input
+                    value={jimengAk}
+                    onChange={(e) => setJimengAk(e.target.value)}
+                    placeholder="VOLC_ACCESSKEY"
+                    className="field font-mono"
+                  />
+                </Field>
+                <Field label="即梦 Secret Key">
+                  <input
+                    value={jimengSk}
+                    onChange={(e) => setJimengSk(e.target.value)}
+                    type="password"
+                    placeholder="VOLC_SECRETKEY"
+                    className="field font-mono"
+                  />
+                </Field>
+                <p className="col-span-2 t-11 leading-[17px] text-[var(--fg-4)]">
+                  即梦只支持首帧图生视频：要求尾帧、多图参考或音频的镜头会自动回落
+                  ARK，每镜的状态里会写明。计价按条估算（官方按条刊例价未公开）。
+                </p>
+              </div>
+            ) : null}
           </Section>
 
           <Section title="预算" hint="超出自动截断">

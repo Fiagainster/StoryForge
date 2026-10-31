@@ -129,6 +129,8 @@ impl ImageVal {
 struct VideoVal {
     path: PathBuf,
     duration: Option<f64>,
+    /// 这条视频是哪家供应商生成的（P1-2 成本对账按家记账；本地素材 = "local"）
+    provider: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -190,6 +192,10 @@ struct RunCtx {
     ffmpeg: PathBuf,
     ffprobe: PathBuf,
     http: reqwest::Client,
+    /// P1-2：视频 Provider 选择（ark / jimeng）与即梦凭据
+    video_provider: String,
+    jimeng_ak: String,
+    jimeng_sk: String,
 }
 
 impl RunCtx {
@@ -516,7 +522,7 @@ async fn ark_video(
     std::fs::create_dir_all(&ctx.tmp_dir).map_err(|e| e.to_string())?;
     let path = ctx.tmp_dir.join(format!("seedance_{}.mp4", new_prompt_id()));
     std::fs::write(&path, &bytes).map_err(|e| format!("落盘视频失败：{e}"))?;
-    Ok(VideoVal { path, duration: None })
+    Ok(VideoVal { path, duration: None, provider: "ark".into() })
 }
 
 trait UrlOpt {
@@ -1104,9 +1110,447 @@ fn node_unit_cost(def: &NodeDef) -> f64 {
 }
 
 /// 整图估算（元，一次成功的理想值）；不可解析的图直接报错
-pub fn estimate_graph_cost(graph: &Value) -> Result<f64, String> {
+pub fn estimate_graph_cost(graph: &Value, video_provider: &str) -> Result<f64, String> {
     let nodes = parse_graph(graph)?;
-    Ok(nodes.values().map(node_unit_cost).sum())
+    Ok(nodes
+        .values()
+        .map(|def| node_unit_cost_routed(def, video_provider))
+        .sum())
+}
+
+// ---------------------------------------------------------------------------
+// P1-2 Provider 抽象：视频生成解锁 ARK 单点依赖。
+// ArkProvider = 现有 Seedance 链路；JimengProvider = 火山 CV（即梦），
+// IAM V4 签名（AK/SK），流程对齐 OpenMontage jimeng_video.py：
+//   CVSync2AsyncSubmitTask → 5s 轮询 CVSync2AsyncGetResult → video_url。
+// 节点按输入能力路由：即梦不支持的能力（尾帧/多图参考/音频）自动回落 ARK。
+// ---------------------------------------------------------------------------
+
+/// 即梦按条估算（元/条，占位：官方未公开按条刊例价，先按此计，确认门可见）
+const JIMENG_CNY_PER_CLIP: f64 = 0.50;
+const JIMENG_REQ_KEY: &str = "jimeng_ti2v_v30_pro";
+const JIMENG_HOST: &str = "visual.volcengineapi.com";
+const JIMENG_REGION: &str = "cn-north-1";
+const JIMENG_SERVICE: &str = "cv";
+const JIMENG_API_VERSION: &str = "2022-08-31";
+
+/// 一条视频生成请求的完整参数（供应商无关）
+#[allow(dead_code)]
+struct VideoReq {
+    node: String,
+    prompt: String,
+    model: String,
+    first_frame: Option<ImageVal>,
+    last_frame: Option<ImageVal>,
+    first_frame_url: String,
+    last_frame_url: String,
+    duration: i64,
+    ratio: String,
+    resolution: String,
+    generate_audio: bool,
+    watermark: bool,
+    reference_urls: Vec<String>,
+    reference_prompt: String,
+}
+
+type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+trait VideoProvider: Send + Sync {
+    fn name(&self) -> &'static str;
+    /// 支持的输入能力；节点要求超出能力时由路由回落 ARK
+    fn capabilities(&self) -> &'static [&'static str];
+    fn estimate_cny(&self, req: &VideoReq) -> f64;
+    fn generate_video<'a>(
+        &'a self,
+        ctx: &'a RunCtx,
+        req: &'a VideoReq,
+    ) -> BoxFuture<'a, Result<VideoVal, String>>;
+}
+
+/// ARK（豆包 Seedance）：能力最全，基准实现
+struct ArkProvider;
+
+impl VideoProvider for ArkProvider {
+    fn name(&self) -> &'static str {
+        "ark"
+    }
+    fn capabilities(&self) -> &'static [&'static str] {
+        &["first_frame", "last_frame", "reference", "audio"]
+    }
+    fn estimate_cny(&self, req: &VideoReq) -> f64 {
+        video_unit_cost(&req.model, &req.resolution, req.duration)
+    }
+    fn generate_video<'a>(
+        &'a self,
+        ctx: &'a RunCtx,
+        req: &'a VideoReq,
+    ) -> BoxFuture<'a, Result<VideoVal, String>> {
+        Box::pin(async move {
+            ark_video(
+                ctx,
+                &req.node,
+                &req.prompt,
+                &req.model,
+                req.first_frame.as_ref(),
+                req.last_frame.as_ref(),
+                &req.first_frame_url,
+                &req.last_frame_url,
+                req.duration,
+                &req.ratio,
+                &req.resolution,
+                req.generate_audio,
+                req.watermark,
+                &req.reference_urls,
+                &req.reference_prompt,
+            )
+            .await
+        })
+    }
+}
+
+/// 即梦（火山 CV）：只支持首帧图生视频，无音频
+struct JimengProvider {
+    ak: String,
+    sk: String,
+}
+
+impl VideoProvider for JimengProvider {
+    fn name(&self) -> &'static str {
+        "jimeng"
+    }
+    fn capabilities(&self) -> &'static [&'static str] {
+        &["first_frame"]
+    }
+    fn estimate_cny(&self, _req: &VideoReq) -> f64 {
+        JIMENG_CNY_PER_CLIP
+    }
+    fn generate_video<'a>(
+        &'a self,
+        ctx: &'a RunCtx,
+        req: &'a VideoReq,
+    ) -> BoxFuture<'a, Result<VideoVal, String>> {
+        Box::pin(async move { jimeng_generate(ctx, req, &self.ak, &self.sk).await })
+    }
+}
+
+/// urllib.parse.quote(s, safe='') 同款百分号编码：只留 A-Za-z0-9 和 _.-
+fn pct_encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'.' | b'-' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// 火山 IAM V4 签名（移植 jimeng_video.py _sign，逐行对齐）。
+/// x_date 由调用方传入（生产传当前 UTC，测试传固定值对拍）。
+fn jimeng_sign(
+    ak: &str,
+    sk: &str,
+    query: &[(&str, &str)],
+    body: &[u8],
+    x_date: &str,
+) -> Vec<(String, String)> {
+    use hmac::{Hmac, Mac};
+    use sha2::{Digest, Sha256};
+    type HmacSha256 = Hmac<Sha256>;
+
+    fn sha256_hex(data: &[u8]) -> String {
+        let mut h = Sha256::new();
+        h.update(data);
+        format!("{:x}", h.finalize())
+    }
+    fn hmac_hex(key: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut mac = HmacSha256::new_from_slice(key).expect("HMAC 接受任意长度 key");
+        mac.update(data);
+        mac.finalize().into_bytes().to_vec()
+    }
+
+    let short_date = &x_date[..8];
+    let body_hash = sha256_hex(body);
+
+    // 参与签名的头（小写、排序）：content-type / host / x-content-sha256 / x-date
+    let lower: Vec<(String, String)> = vec![
+        ("content-type".into(), "application/json".into()),
+        ("host".into(), JIMENG_HOST.into()),
+        ("x-content-sha256".into(), body_hash.clone()),
+        ("x-date".into(), x_date.into()),
+    ];
+    let signed_str = lower
+        .iter()
+        .map(|(k, _)| k.as_str())
+        .collect::<Vec<_>>()
+        .join(";");
+    let canonical_headers: String =
+        lower.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
+
+    let mut q: Vec<(String, String)> = query
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    q.sort();
+    let canonical_query = q
+        .iter()
+        .map(|(k, v)| format!("{}={}", pct_encode(k), pct_encode(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+
+    let canonical_request = [
+        "POST",
+        "/",
+        canonical_query.as_str(),
+        canonical_headers.as_str(),
+        signed_str.as_str(),
+        body_hash.as_str(),
+    ]
+    .join("\n");
+
+    let credential_scope = format!("{short_date}/{JIMENG_REGION}/{JIMENG_SERVICE}/request");
+    let string_to_sign = [
+        "HMAC-SHA256",
+        x_date,
+        credential_scope.as_str(),
+        sha256_hex(canonical_request.as_bytes()).as_str(),
+    ]
+    .join("\n");
+
+    let k_date = hmac_hex(sk.as_bytes(), short_date.as_bytes());
+    let k_region = hmac_hex(&k_date, JIMENG_REGION.as_bytes());
+    let k_service = hmac_hex(&k_region, JIMENG_SERVICE.as_bytes());
+    let k_signing = hmac_hex(&k_service, b"request");
+    let signature: Vec<u8> = {
+        let mut mac = HmacSha256::new_from_slice(&k_signing).unwrap();
+        mac.update(string_to_sign.as_bytes());
+        mac.finalize().into_bytes().to_vec()
+    };
+    let sig_hex: String = signature.iter().map(|b| format!("{b:02x}")).collect();
+
+    vec![
+        ("Content-Type".into(), "application/json".into()),
+        ("X-Date".into(), x_date.into()),
+        ("X-Content-Sha256".into(), body_hash),
+        (
+            "Authorization".into(),
+            format!(
+                "HMAC-SHA256 Credential={ak}/{credential_scope}, SignedHeaders={signed_str}, Signature={sig_hex}"
+            ),
+        ),
+    ]
+}
+
+/// 即梦请求体（纯函数，可单测）：duration→frames（>=10s→241，否则 121）
+fn jimeng_payload(req: &VideoReq) -> Value {
+    let dur = if req.duration <= 0 { 5 } else { req.duration };
+    let frames = if dur >= 10 { 241 } else { 121 };
+    let ratio = match req.ratio.trim() {
+        "" | "adaptive" => "9:16",
+        r => r,
+    };
+    let mut p = json!({
+        "req_key": JIMENG_REQ_KEY,
+        "prompt": req.prompt,
+        "frames": frames,
+        "aspect_ratio": ratio,
+        "seed": -1,
+    });
+    let first = req
+        .first_frame_url
+        .trim()
+        .non_empty()
+        .map(|s| s.to_string())
+        .or_else(|| req.first_frame.as_ref().map(|f| f.data_url()));
+    if let Some(u) = first {
+        p["image_urls"] = json!([u]);
+    }
+    p
+}
+
+/// 即梦签名请求（提交与轮询共用）：签 V4 头 → POST → 解析 JSON
+async fn jimeng_post(
+    http: &reqwest::Client,
+    ak: &str,
+    sk: &str,
+    q: &[(&str, &str)],
+    body: Vec<u8>,
+) -> Result<Value, String> {
+    let x_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let headers = jimeng_sign(ak, sk, q, &body, &x_date);
+    let qs: Vec<String> = q
+        .iter()
+        .map(|(k, v)| format!("{}={}", pct_encode(k), pct_encode(v)))
+        .collect();
+    let rb = format!("https://{JIMENG_HOST}/?{}", qs.join("&"));
+    let mut req = http.post(&rb);
+    for (k, v) in &headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    let resp = req
+        .timeout(Duration::from_secs(60))
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| format!("即梦请求失败：{e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("即梦请求失败 HTTP {}", resp.status()));
+    }
+    resp.json::<Value>()
+        .await
+        .map_err(|e| format!("即梦响应解析失败：{e}"))
+}
+
+/// 即梦生视频：提交 → 5s 轮询 → 下载落盘
+async fn jimeng_generate(
+    ctx: &RunCtx,
+    req: &VideoReq,
+    ak: &str,
+    sk: &str,
+) -> Result<VideoVal, String> {
+    let submit_query: [(&str, &str); 2] =
+        [("Action", "CVSync2AsyncSubmitTask"), ("Version", JIMENG_API_VERSION)];
+    let poll_query: [(&str, &str); 2] =
+        [("Action", "CVSync2AsyncGetResult"), ("Version", JIMENG_API_VERSION)];
+    let submit_body = jimeng_payload(req).to_string().into_bytes();
+
+    let created = jimeng_post(&ctx.http, ak, sk, &submit_query, submit_body).await?;
+    let task_id = match created.pointer("/data/task_id") {
+        Some(Value::String(s)) => s.clone(),
+        Some(v) if v.is_i64() || v.is_u64() => v.to_string(),
+        _ => return Err(format!("即梦未返回 task_id: {}", truncate(&created.to_string(), 400))),
+    };
+
+    let poll_body = json!({
+        "req_key": JIMENG_REQ_KEY,
+        "task_id": task_id,
+        "req_json": "{\"return_url\":true}",
+    })
+    .to_string()
+    .into_bytes();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(25 * 60);
+    let started = std::time::Instant::now();
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("即梦任务超时（task {task_id}）"));
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        ctx.check_cancel()?;
+        let info = jimeng_post(&ctx.http, ak, sk, &poll_query, poll_body.clone()).await?;
+        let status = info.pointer("/data/status").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if !status.is_empty() {
+            let secs = started.elapsed().as_secs();
+            ctx.emit(json!({ "type": "progress", "node": req.node, "detail": format!("生成中 · {secs}s · {status} · 即梦") }));
+        }
+        if status == "done" {
+            let video_url = info
+                .pointer("/data/video_url")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("即梦任务完成但没有视频地址: {}", truncate(&info.to_string(), 400)))?;
+            let bytes = download(ctx, video_url).await?;
+            std::fs::create_dir_all(&ctx.tmp_dir).map_err(|e| e.to_string())?;
+            let path = ctx.tmp_dir.join(format!("jimeng_{}.mp4", new_prompt_id()));
+            std::fs::write(&path, &bytes).map_err(|e| format!("落盘视频失败：{e}"))?;
+            let duration = ffprobe_duration(&ctx.ffprobe, &path);
+            return Ok(VideoVal { path, duration, provider: "jimeng".into() });
+        }
+        if matches!(status.as_str(), "not_found" | "expired") {
+            return Err(format!("即梦任务无效（{status}）: {}", truncate(&info.to_string(), 400)));
+        }
+    }
+}
+
+/// 选中即梦时，这一镜能不能真用即梦（能力 + 凭据检查；纯逻辑可单测）
+fn jimeng_can_serve(
+    provider: &str,
+    has_last_frame: bool,
+    has_reference: bool,
+    generate_audio: bool,
+    ak_configured: bool,
+) -> Result<(), String> {
+    if provider != "jimeng" {
+        return Ok(()); // 没选即梦，直接走 ARK
+    }
+    let mut missing: Vec<&str> = Vec::new();
+    if has_last_frame {
+        missing.push("尾帧");
+    }
+    if has_reference {
+        missing.push("多图参考");
+    }
+    if generate_audio {
+        missing.push("音频");
+    }
+    if !missing.is_empty() {
+        return Err(format!("即梦不支持{}", missing.join("、")));
+    }
+    if !ak_configured {
+        return Err("即梦 AK/SK 未配置".into());
+    }
+    Ok(())
+}
+
+/// 视频节点统一入口：按配置选 Provider，能力不够回落 ARK
+async fn run_video_routed(ctx: &RunCtx, req: &VideoReq) -> Result<VideoVal, String> {
+    let ak_ready = !ctx.jimeng_ak.trim().is_empty() && !ctx.jimeng_sk.trim().is_empty();
+    if let Err(why) = jimeng_can_serve(
+        &ctx.video_provider,
+        req.last_frame.is_some() || !req.last_frame_url.trim().is_empty(),
+        !req.reference_urls.is_empty(),
+        req.generate_audio,
+        ak_ready,
+    ) {
+        ctx.emit(json!({
+            "type": "progress",
+            "node": req.node,
+            "detail": format!("{why}，本镜回落 ARK"),
+        }));
+        return ArkProvider.generate_video(ctx, req).await;
+    }
+    let provider = video_provider(&ctx.video_provider, &ctx.jimeng_ak, &ctx.jimeng_sk);
+    provider.generate_video(ctx, req).await
+}
+
+fn video_provider(name: &str, jimeng_ak: &str, jimeng_sk: &str) -> Box<dyn VideoProvider> {
+    if name == "jimeng" && !jimeng_ak.trim().is_empty() && !jimeng_sk.trim().is_empty() {
+        Box::new(JimengProvider {
+            ak: jimeng_ak.to_string(),
+            sk: jimeng_sk.to_string(),
+        })
+    } else {
+        Box::new(ArkProvider)
+    }
+}
+
+/// 选中即梦且这镜兼容即梦时按条计价，否则按 ARK 表
+fn node_unit_cost_routed(def: &NodeDef, video_provider: &str) -> f64 {
+    match def.class_type.as_str() {
+        "DramaShotVideo" | "StoryForgeSeedance" => {
+            let has_last = is_link(def.inputs.get("last_frame").unwrap_or(&Value::Null));
+            let has_ref = ["character1_url", "character2_url", "character3_url"]
+                .iter()
+                .any(|k| {
+                    !def.inputs
+                        .get(*k)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .is_empty()
+                });
+            let audio = def.inputs.get("generate_audio").and_then(|v| v.as_bool()).unwrap_or(false);
+            if video_provider == "jimeng" {
+                jimeng_can_serve("jimeng", has_last, has_ref, audio, true)
+                    .map(|_| JIMENG_CNY_PER_CLIP)
+                    .unwrap_or_else(|_| node_unit_cost(def))
+            } else {
+                node_unit_cost(def)
+            }
+        }
+        _ => node_unit_cost(def),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1460,24 +1904,23 @@ async fn execute_node(
             } else {
                 prompt.clone()
             };
-            let val = ark_video(
-                ctx,
-                id,
-                &prompt,
-                &inp_str("model"),
-                Some(&first_frame),
-                last_frame.as_ref(),
-                &first_url,
-                &last_url,
-                def.inputs.get("duration").and_then(|v| v.as_i64()).unwrap_or(5),
-                "adaptive",
-                &inp_str("resolution"),
-                inp_bool("generate_audio"),
-                inp_bool("watermark"),
-                &refs,
-                &ref_prompt,
-            )
-            .await?;
+            let req = VideoReq {
+                node: id.to_string(),
+                prompt,
+                model: inp_str("model"),
+                first_frame: Some(first_frame),
+                last_frame,
+                first_frame_url: first_url,
+                last_frame_url: last_url,
+                duration: def.inputs.get("duration").and_then(|v| v.as_i64()).unwrap_or(5),
+                ratio: "adaptive".into(),
+                resolution: inp_str("resolution"),
+                generate_audio: inp_bool("generate_audio"),
+                watermark: inp_bool("watermark"),
+                reference_urls: refs,
+                reference_prompt: ref_prompt,
+            };
+            let val = run_video_routed(ctx, &req).await?;
             Ok(vec![NodeVal::Video(Arc::new(val))])
         }
 
@@ -1504,24 +1947,23 @@ async fn execute_node(
             let last = img(upstream(id, "last_frame", 0, nodes, produced));
             let first_url = as_string(upstream(id, "first_frame_url", 1, nodes, produced));
             let last_url = as_string(upstream(id, "last_frame_url", 1, nodes, produced));
-            let val = ark_video(
-                ctx,
-                id,
-                &inp_str("prompt"),
-                &inp_str("model"),
-                first.as_ref(),
-                last.as_ref(),
-                &first_url,
-                &last_url,
-                def.inputs.get("duration").and_then(|v| v.as_i64()).unwrap_or(5),
-                &inp_str("ratio"),
-                &inp_str("resolution"),
-                inp_bool("generate_audio"),
-                inp_bool("watermark"),
-                &[],
-                "",
-            )
-            .await?;
+            let req = VideoReq {
+                node: id.to_string(),
+                prompt: inp_str("prompt"),
+                model: inp_str("model"),
+                first_frame: first,
+                last_frame: last,
+                first_frame_url: first_url,
+                last_frame_url: last_url,
+                duration: def.inputs.get("duration").and_then(|v| v.as_i64()).unwrap_or(5),
+                ratio: inp_str("ratio"),
+                resolution: inp_str("resolution"),
+                generate_audio: inp_bool("generate_audio"),
+                watermark: inp_bool("watermark"),
+                reference_urls: vec![],
+                reference_prompt: String::new(),
+            };
+            let val = run_video_routed(ctx, &req).await?;
             Ok(vec![NodeVal::Video(Arc::new(val))])
         }
 
@@ -1598,7 +2040,7 @@ async fn execute_node(
                 ));
             }
             let duration = ffprobe_duration(&ctx.ffprobe, &path);
-            Ok(vec![NodeVal::Video(Arc::new(VideoVal { path, duration }))])
+            Ok(vec![NodeVal::Video(Arc::new(VideoVal { path, duration, provider: "local".into() }))])
         }
 
         /* ---------------- 落盘：Save* ---------------- */
@@ -1720,12 +2162,18 @@ pub fn kernel_submit(
     ffprobe: String,
     budget_limit: f64,
     budget_mode: String,
+    video_provider: String,
+    jimeng_ak: String,
+    jimeng_sk: String,
 ) -> Result<Value, String> {
     let nodes = parse_graph(&graph)?;
     let order = topo_order(&nodes)?;
 
     // P0-2 预算治理：cap 模式下估算（含重试缓冲）超限直接拒收，一个请求都不发
-    let est = nodes.values().map(node_unit_cost).sum::<f64>();
+    let est = nodes
+        .values()
+        .map(|def| node_unit_cost_routed(def, &video_provider))
+        .sum::<f64>();
     if budget_mode == "cap" && budget_limit > 0.0 && est * COST_RETRY_BUFFER > budget_limit {
         return Err(format!(
             "预算拦截（cap 模式）：预计 ¥{est:.2}、含重试缓冲至多 ¥{:.2}，超过单次上限 ¥{budget_limit:.2}。可到「设置 → 预算」调高上限，或改成提醒模式。",
@@ -1757,6 +2205,9 @@ pub fn kernel_submit(
         ffprobe: PathBuf::from(&ffprobe),
         http,
         app: app.clone(),
+        video_provider,
+        jimeng_ak,
+        jimeng_sk,
     });
 
     let pid = prompt_id.clone();
@@ -1798,8 +2249,16 @@ pub fn kernel_submit(
                     if AUDIT_GEN_NODES.contains(&def.class_type.as_str()) {
                         let mut attempt: u32 = 0;
                         loop {
-                            // P0-2 对账：每跑一次（首跑 + 重跑）记一次钱
-                            *ctx.run.cost_actual.lock().unwrap() += node_unit_cost(def);
+                            // P0-2 对账：每跑一次（首跑 + 重跑）记一次钱，按实际用的 Provider 计价
+                            let used_provider = outs
+                                .iter()
+                                .find_map(|v| match v {
+                                    NodeVal::Video(vid) => Some(vid.provider.clone()),
+                                    _ => None,
+                                })
+                                .unwrap_or_else(|| ctx.video_provider.clone());
+                            *ctx.run.cost_actual.lock().unwrap() +=
+                                node_unit_cost_routed(def, &used_provider);
                             let audit = audit_node_outputs(
                                 &ctx.ffmpeg,
                                 &ctx.ffprobe,
@@ -2114,7 +2573,114 @@ mod audit_tests {
             }"#,
         )
         .unwrap();
-        let est = estimate_graph_cost(&g).unwrap();
+        let est = estimate_graph_cost(&g, "ark").unwrap();
         assert!((est - (0.30 + 7.55)).abs() < 1e-9, "est = {est}");
+    }
+
+    // ---------------- P1-2 Provider ----------------
+
+    /// V4 签名对拍：与 OpenMontage jimeng_video.py 同算法复算的参照值（冻结时间）
+    #[test]
+    fn jimeng_v4_signature_matches_reference() {
+        let body: &[u8] =
+            r#"{"req_key": "jimeng_ti2v_v30_pro", "prompt": "测试", "frames": 121, "aspect_ratio": "9:16", "seed": -1}"#.as_bytes();
+        let query = [("Action", "CVSync2AsyncSubmitTask"), ("Version", "2022-08-31")];
+        let headers = jimeng_sign("AKTEST123", "SKTEST456", &query, body, "20261031T080000Z");
+        let auth = headers
+            .iter()
+            .find(|(k, _)| k == "Authorization")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert_eq!(
+            auth,
+            "HMAC-SHA256 Credential=AKTEST123/20261031/cn-north-1/cv/request, SignedHeaders=content-type;host;x-content-sha256;x-date, Signature=06ae1f841d6c1a1ed365217e69863dbc944571176a5ed5af90af7fa96ba089a9"
+        );
+    }
+
+    #[test]
+    fn pct_encode_matches_python_quote() {
+        assert_eq!(pct_encode("CVSync2AsyncSubmitTask"), "CVSync2AsyncSubmitTask");
+        assert_eq!(pct_encode("2022-08-31"), "2022-08-31", "- 属 unreserved");
+        assert_eq!(pct_encode("a b/c"), "a%20b%2Fc");
+        assert_eq!(pct_encode("测"), "%E6%B5%8B");
+    }
+
+    fn video_req(over: impl Fn(&mut VideoReq)) -> VideoReq {
+        let mut r = VideoReq {
+            node: "v1".into(),
+            prompt: "测试".into(),
+            model: "doubao-seedance-2-5-260628".into(),
+            first_frame: None,
+            last_frame: None,
+            first_frame_url: String::new(),
+            last_frame_url: String::new(),
+            duration: 5,
+            ratio: "adaptive".into(),
+            resolution: "720p".into(),
+            generate_audio: false,
+            watermark: false,
+            reference_urls: vec![],
+            reference_prompt: String::new(),
+        };
+        over(&mut r);
+        r
+    }
+
+    #[test]
+    fn jimeng_payload_maps_duration_and_ratio() {
+        let p = jimeng_payload(&video_req(|r| {
+            r.duration = 5;
+            r.ratio = "adaptive".into();
+        }));
+        assert_eq!(p["frames"], 121);
+        assert_eq!(p["aspect_ratio"], "9:16", "adaptive 映射成竖屏");
+        assert_eq!(p["req_key"], "jimeng_ti2v_v30_pro");
+        assert!(p.get("image_urls").is_none(), "没有首帧就不带 image_urls");
+
+        let p = jimeng_payload(&video_req(|r| {
+            r.duration = 12;
+            r.ratio = "16:9".into();
+            r.first_frame_url = "https://example.com/f.png".into();
+        }));
+        assert_eq!(p["frames"], 241, ">=10s 用 241 帧");
+        assert_eq!(p["aspect_ratio"], "16:9");
+        assert_eq!(p["image_urls"], json!(["https://example.com/f.png"]));
+    }
+
+    #[test]
+    fn jimeng_routing_falls_back() {
+        // 兼容：无尾帧 / 无参考 / 不要音频 → 可以用即梦
+        assert!(jimeng_can_serve("jimeng", false, false, false, true).is_ok());
+        // 有音频要求 → 回落（错误信息说明原因）
+        assert!(jimeng_can_serve("jimeng", false, false, true, true).is_err());
+        // 没配 AK → 回落
+        assert!(jimeng_can_serve("jimeng", false, false, false, false).is_err());
+        // 选的是 ark → 永远直接走
+        assert!(jimeng_can_serve("ark", true, true, true, false).is_ok());
+    }
+
+    #[test]
+    fn jimeng_pricing_and_fallback_pricing() {
+        let mk_def = |class: &str, extra: Value| -> NodeDef {
+            let mut inputs = json!({
+                "prompt": "x", "model": "doubao-seedance-2-5-260628",
+                "duration": 5, "resolution": "720p",
+            });
+            if let (Some(obj), Some(e)) = (inputs.as_object_mut(), extra.as_object()) {
+                for (k, v) in e {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            NodeDef { class_type: class.into(), inputs }
+        };
+        // 即梦兼容（无音频）→ 按条
+        let d = mk_def("DramaShotVideo", json!({"generate_audio": false}));
+        assert!((node_unit_cost_routed(&d, "jimeng") - JIMENG_CNY_PER_CLIP).abs() < 1e-9);
+        // 要音频 → 不兼容即梦，按 ARK 表
+        let d = mk_def("DramaShotVideo", json!({"generate_audio": true}));
+        assert!((node_unit_cost_routed(&d, "jimeng") - 7.55).abs() < 1e-9);
+        // 选 ark → 按 ARK 表
+        let d = mk_def("DramaShotVideo", json!({"generate_audio": false}));
+        assert!((node_unit_cost_routed(&d, "ark") - 7.55).abs() < 1e-9);
     }
 }
