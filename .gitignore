@@ -17,3 +17,6 @@ app/src-tauri/bin/
 # 系统
 Thumbs.db
 .DS_Store
+
+# 项目数据（用户创作内容，不进 git）
+projects/
