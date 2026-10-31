@@ -1,14 +1,14 @@
 # 依赖与构建产物
-app/node_modules/
-app/dist/
-app/src-tauri/target/
+node_modules/
+dist/
+src-tauri/target/
 
 # 引擎工作区（原 ComfyUI 内核 + 运行环境；换原生内核后仅存运行时数据）
-app/engine/
+engine/
 
 # ffmpeg / ffprobe 随包二进制（~90MB，走 GitHub Release 分发，不入库）
-app/bin/
-app/src-tauri/bin/
+bin/
+src-tauri/bin/
 
 # 自测产物与临时文件
 .workbuddy/shots/
@@ -23,3 +23,9 @@ projects/
 
 # WorkBuddy 协作数据（AI 工作日志/截图，本地保留不进库）
 .workbuddy/
+
+# 测试编译产物
+.test-build/
+
+# 参考项目（本地克隆，不入库）
+OpenMontage-main/

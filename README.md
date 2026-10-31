@@ -39,10 +39,10 @@
 
 ## 目录
 
-整个产品只有一个目录 `app/`：前端、桌面壳、执行内核、文档、脚本全部在里面，不引用外部目录。
+整个产品就是仓库本身：前端、桌面壳、执行内核、文档、脚本全在根目录下，不引用外部目录。
 
 ```
-app/
+
 ├── src/                         前端（React + TypeScript）
 │   └── lib/node-library.json    内核节点目录（12 节点白名单）
 ├── src-tauri/                   桌面壳 + 原生执行内核（Tauri + Rust）
@@ -61,7 +61,7 @@ app/
 └── scripts/                     构建与测试脚本
 ```
 
-根目录只有 `README.md`、`启动StoryForge.bat` 和 `app/`。
+根目录就是产品本体：`README.md`、`启动StoryForge.bat` 和全部源码。
 
 ## 首次运行
 
@@ -192,7 +192,7 @@ ARK Key 也可以读环境变量 `ARK_API_KEY`（内核每次提交前都会读�
 
 | 内容 | 位置 |
 |---|---|
-| 生成产物 | `app/engine/workspace/output/` |
+| 生成产物 | `engine/workspace/output/` |
 | 项目数据 | 项目根目录（默认 `D:/StoryForgeProjects/`，可在设置里换）下的 `<项目名>/project.json`，落盘时自动留最近 3 份 `.bak` |
 | 导出成片 / 分镜表 | `<项目名>/export/` |
 | 界面配置 | 系统配置目录 `com.storyforge.desktop/config.json` |
@@ -202,12 +202,12 @@ ARK Key 也可以读环境变量 `ARK_API_KEY`（内核每次提交前都会读�
 项目整体可以随意移动：Rust 侧会从可执行文件位置向上寻找 `engine/`（workspace 或 prompts 任一存在即认定）
 自动定位根目录；也可以用环境变量 `STORYFORGE_ROOT` 或设置页的「项目根目录」显式指定。
 
-ffmpeg / ffprobe 随安装包分发；源码运行时从 `app/bin/` 读取。改提示词资产直接编辑
-`app/engine/prompts/*.json`（风格圣经 / 分镜语法 / 负面词），保存即生效。
+ffmpeg / ffprobe 随安装包分发；源码运行时从 `bin/` 读取。改提示词资产直接编辑
+`engine/prompts/*.json`（风格圣经 / 分镜语法 / 负面词），保存即生效。
 
 ## 生成节点
 
-节点实现移入了内核本体（`app/src-tauri/src/kernel.rs`），节点目录见 `app/src/lib/node-library.json`：
+节点实现移入了内核本体（`src-tauri/src/kernel.rs`），节点目录见 `src/lib/node-library.json`：
 
 - `短剧 · 角色定妆`：角色锚点 → 定妆参考图（Seedream 文生图）
 - `短剧 · 分镜首帧`：角色参考图 + 景别/运镜/动作/情绪 → 一张定帧
@@ -227,7 +227,7 @@ Seedance 2.5 不接受直接上传的真人脸，也不接受把带人脸的图�
 
 ## 文档
 
-- [架构方案](app/docs/architecture.md)
-- [火山方舟接口参考](app/docs/reference/调用参考.txt)
-- [历史方案](app/docs/archive/)
-- [运行截图](app/docs/shots/)
+- [架构方案](docs/architecture.md)
+- [火山方舟接口参考](docs/reference/调用参考.txt)
+- [历史方案](docs/archive/)
+- [运行截图](docs/shots/)

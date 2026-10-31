@@ -123,4 +123,4 @@ const payload = {
 writeFileSync(OUT, JSON.stringify(payload), "utf8");
 const kb = (Buffer.byteLength(JSON.stringify(payload)) / 1024).toFixed(0);
 console.log(`nodes=${usable.length} reference=${partner.length} blocked=${needWeights.length}`);
-console.log(`-> app/src/lib/node-library.json (${kb} KB)`);
+console.log(`-> src/lib/node-library.json (${kb} KB)`);
