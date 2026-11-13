@@ -40,6 +40,7 @@ fn default_config() -> Value {
     json!({
         "configVersion": 3,
         "projectRoot": "",
+        "productRoot": "",
         "comfyDir": "engine/ComfyUI",
         "comfyBase": "engine/workspace",
         "venvPython": "engine/venv/Scripts/python.exe",
@@ -176,43 +177,103 @@ fn walk_to_root(start: &Path) -> Option<PathBuf> {
         .find(|p| is_product_root(p))
 }
 
-/// 产品根目录：优先环境变量 / 配置，其次从 exe 与当前目录向上找。
-/// 不再依赖任何写死的绝对路径。
-fn detect_root(cfg: &Value) -> PathBuf {
-    if let Ok(env_root) = std::env::var("STORYFORGE_ROOT") {
-        let p = PathBuf::from(env_root);
-        if is_product_root(&p) {
-            return p;
+/// 安装版自己的运行时目录：`%APPDATA%\com.storyforge.desktop\root`。
+///
+/// 以前这里没有兜底，最后一条是 `option_env!("CARGO_MANIFEST_DIR")`——那是
+/// 编译期写进二进制的源码绝对路径。于是安装版跑到别人机器上也去翻
+/// `D:/Project/自主规划AI短剧制作探索`：本机有源码就"命中"，换台机器就落到
+/// 当前工作目录（往往是 System32），写出来的东西散落各处。
+fn data_root() -> PathBuf {
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        return PathBuf::from(appdata)
+            .join("com.storyforge.desktop")
+            .join("root");
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home)
+            .join(".local/share/com.storyforge.desktop/root");
+    }
+    std::env::temp_dir().join("storyforge")
+}
+
+/// 产品根目录的选取顺序，纯函数便于单测：
+///   1. `STORYFORGE_ROOT`（绿色版 / 运维指定）
+///   2. 配置里的 `productRoot`（用户显式指定的产品目录）
+///   3. exe 所在位置向上找（免安装包解压到带 engine/ 的目录）
+///   4. 开发版才允许向上找当前目录（`npm run tauri dev` 时 cwd 是仓库）
+///   5. 兜底：用户数据目录
+///
+/// 安装版**不会**再因为"这台机器上恰好有源码目录"而跑偏：`step 3` 从 exe
+/// 出发，`D:/System/StoryForge` 上面没有 `engine/`，于是稳定落到 `data_root()`。
+fn pick_root(
+    env_root: Option<PathBuf>,
+    configured: Option<PathBuf>,
+    exe: Option<PathBuf>,
+    cwd: Option<PathBuf>,
+    is_dev: bool,
+    data: PathBuf,
+) -> PathBuf {
+    if let Some(p) = env_root.filter(|p| is_product_root(p)) {
+        return p;
+    }
+    if let Some(p) = configured.filter(|p| is_product_root(p)) {
+        return p;
+    }
+    if let Some(dir) = exe.as_deref() {
+        if let Some(root) = walk_to_root(dir) {
+            return root;
         }
     }
-    if let Some(configured) = cfg["projectRoot"]
-        .as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        let p = PathBuf::from(configured);
-        if is_product_root(&p) {
-            return p;
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
+    if is_dev {
+        if let Some(dir) = cwd.as_deref() {
             if let Some(root) = walk_to_root(dir) {
                 return root;
             }
         }
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        if let Some(root) = walk_to_root(&cwd) {
-            return root;
+    data
+}
+
+fn detect_root(cfg: &Value) -> PathBuf {
+    let env_root = std::env::var("STORYFORGE_ROOT").ok().map(PathBuf::from);
+    // 只认 productRoot。projectRoot 是 v1 遗留、如今被界面当作"作品存放位置"，
+    // 拿它当产品根会把程序目录指到用户的项目盘上去。
+    let configured = cfg["productRoot"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(PathBuf::from));
+    pick_root(
+        env_root,
+        configured,
+        exe,
+        std::env::current_dir().ok(),
+        cfg!(debug_assertions),
+        data_root(),
+    )
+}
+
+/// 首次运行把运行时目录铺好：素材/产物/临时目录，以及一份可改的提示词副本。
+/// 提示词缺失也不影响执行（模板已编译进二进制），写出来只是让人能改。
+fn ensure_root(root: &Path) {
+    let engine = root.join("engine");
+    for sub in ["workspace/input", "workspace/output", "workspace/temp", "prompts"] {
+        let _ = std::fs::create_dir_all(engine.join(sub));
+    }
+    let prompts = engine.join("prompts");
+    for (name, body) in [
+        ("style-bible.json", kernel::BIBLE_JSON),
+        ("shot-grammar.json", kernel::GRAMMAR_JSON),
+        ("negative.json", kernel::NEGATIVE_JSON),
+    ] {
+        let p = prompts.join(name);
+        if !p.is_file() {
+            let _ = std::fs::write(&p, body);
         }
     }
-    if let Some(manifest) = option_env!("CARGO_MANIFEST_DIR") {
-        if let Some(root) = walk_to_root(Path::new(manifest)) {
-            return root;
-        }
-    }
-    std::env::current_dir().unwrap_or_default()
 }
 
 fn resolve(cfg: &Value, root: &Path, key: &str) -> PathBuf {
@@ -261,19 +322,28 @@ fn tool_candidates(app: &tauri::AppHandle) -> Vec<PathBuf> {
 fn env_check(app: tauri::AppHandle) -> Value {
     let cfg = load_config(&app);
     let root = detect_root(&cfg);
+    // 装到干净机器上第一次跑时，运行时目录还不存在：这里顺手铺好，
+    // 免得后面写产物、读素材时到处 create_dir_all 各建各的。
+    ensure_root(&root);
     let workspace = resolve(&cfg, &root, "comfyBase");
     let prompts = root.join("engine").join("prompts");
     let ffmpeg = kernel::find_tool(&tool_candidates(&app), &root, "ffmpeg");
     let ffprobe = kernel::find_tool(&tool_candidates(&app), &root, "ffprobe");
+    // 是否用的自动数据目录（安装版的常态）；界面据此把"程序目录"标成只读展示
+    let auto_root = root == data_root();
 
     json!({
         "configPath": config_path(&app).map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
         "projectRoot": root.to_string_lossy(),
+        "productRoot": root.to_string_lossy(),
+        "productRootAuto": auto_root,
+        "promptsDir": prompts.to_string_lossy(),
         "comfyDir": workspace.to_string_lossy(),
         "comfyBase": workspace.to_string_lossy(),
         "comfyDirExists": workspace.is_dir(),
         "comfyBaseExists": workspace.is_dir(),
-        "nodesInstalled": prompts.join("style-bible.json").is_file(),
+        // 提示词模板已编译进二进制，外部 json 只是可改副本 → 永远可用
+        "nodesInstalled": true,
         "venvPython": "",
         "venvExists": ffmpeg.is_some(),
         "ffmpegReady": ffmpeg.is_some() && ffprobe.is_some(),
@@ -1293,4 +1363,112 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("StoryForge 启动失败");
+}
+
+#[cfg(test)]
+mod root_tests {
+    use super::*;
+
+    fn mk_root(dir: &Path) {
+        std::fs::create_dir_all(dir.join("engine/workspace")).unwrap();
+    }
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
+        let d = std::env::temp_dir().join(format!(
+            "sf_root_{tag}_{}_{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn installed_build_never_lands_in_source_tree() {
+        // 安装版：exe 在 D:/System/StoryForge，上面没有 engine/；
+        // 就算机器上另有源码目录（cwd 指过去），也不许跟过去。
+        let src = tmpdir("src");
+        mk_root(&src);
+        let exe = tmpdir("exe");
+        let data = tmpdir("data");
+        let got = pick_root(None, None, Some(exe.clone()), Some(src.clone()), false, data.clone());
+        assert_eq!(got, data, "安装版必须落到自己的数据目录");
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&exe);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn portable_build_uses_engine_beside_exe() {
+        // 免安装：整个产品目录一起拷走，exe 旁边就有 engine/
+        let portable = tmpdir("portable");
+        mk_root(&portable);
+        let data = tmpdir("data");
+        let got = pick_root(None, None, Some(portable.clone()), None, false, data);
+        assert_eq!(got, portable, "绿色版要认自己旁边那套 engine/");
+        let _ = std::fs::remove_dir_all(&portable);
+    }
+
+    #[test]
+    fn dev_build_follows_cwd_to_repo_root() {
+        // npm run tauri dev：exe 在 src-tauri/target/debug，cwd 是仓库根
+        let repo = tmpdir("repo");
+        mk_root(&repo);
+        let exe = repo.join("src-tauri/target/debug");
+        std::fs::create_dir_all(&exe).unwrap();
+        let data = tmpdir("data");
+        let got = pick_root(None, None, Some(exe), Some(repo.clone()), true, data);
+        assert_eq!(got, repo, "开发版要留在源码树里");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn explicit_config_beats_autodetect() {
+        let cfg_root = tmpdir("cfgroot");
+        mk_root(&cfg_root);
+        let data = tmpdir("data");
+        let got = pick_root(
+            None,
+            Some(cfg_root.clone()),
+            None,
+            None,
+            false,
+            data.clone(),
+        );
+        assert_eq!(got, cfg_root);
+        let _ = std::fs::remove_dir_all(&cfg_root);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn config_pointing_at_plain_folder_is_ignored() {
+        // productRoot 填了个普通文件夹（没有 engine/）→ 不认，别把产物散进去
+        let plain = tmpdir("plain");
+        let data = tmpdir("data");
+        let got = pick_root(None, Some(plain.clone()), None, None, false, data.clone());
+        assert_eq!(got, data, "不是产品目录的路径不能当根");
+        let _ = std::fs::remove_dir_all(&plain);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn ensure_root_lays_out_first_run_dirs() {
+        let root = tmpdir("ensure");
+        ensure_root(&root);
+        for sub in ["workspace/input", "workspace/output", "workspace/temp", "prompts"] {
+            assert!(root.join("engine").join(sub).is_dir(), "{sub} 没铺出来");
+        }
+        // 提示词副本要写出来（能改），且内容与内置模板一致
+        let p = root.join("engine/prompts/style-bible.json");
+        assert!(p.is_file());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), kernel::BIBLE_JSON);
+        // 重复调用不覆盖用户改过的文件
+        std::fs::write(&p, "{\"custom\":1}").unwrap();
+        ensure_root(&root);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "{\"custom\":1}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

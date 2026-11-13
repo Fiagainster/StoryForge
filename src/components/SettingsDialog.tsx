@@ -32,7 +32,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
 
   useEffect(() => {
     if (!config) return;
-    setRoot(config.projectRoot || "");
+    setRoot(config.productRoot || "");
     setBaseUrl(config.llm?.baseUrl || "");
     setApiKey(config.llm?.apiKey || "");
     setModel(config.llm?.model || "");
@@ -54,7 +54,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
 
   const buildPatch = () =>
     ({
-      projectRoot: root.trim(),
+      productRoot: root.trim(),
       llm: { baseUrl, apiKey, model },
       ark: { apiKey: arkKey },
       image: { model: imageModel },
@@ -367,24 +367,30 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
 
           <Section title="执行内核" hint="常驻，无需启动">
             <div className="grid grid-cols-[120px_1fr] gap-3">
-              <Field label="项目根目录" hint="留空自动识别">
+              <Field label="程序目录" hint="留空 = 自动，一般不用填">
                 <input
                   value={root}
                   onChange={(e) => setRoot(e.target.value)}
-                  placeholder={env?.projectRoot || "自动识别"}
+                  placeholder={env?.productRoot || env?.projectRoot || "自动（安装版用 AppData）"}
                   className="field font-mono"
                 />
               </Field>
             </div>
             <p className="t-11 leading-[17px] text-[var(--fg-4)]">
               生成算力在云端 ARK；本地内核只做图的派发、收文件和像素杂活（占位图 / 缩放 / 抽帧 / 拼接），
-              不占显存、没有启动等待。停用旧的「空闲自动停」已随 ComfyUI 一起退役。
+              不占显存、没有启动等待。安装版把运行时数据放在自己的 AppData 目录里，
+              不读也不写你装程序的文件夹；只有填了「程序目录」且那里确实有 engine/ 时才会改用指定位置。
             </p>
             <div className="space-y-1 rounded-[10px] bg-[var(--bg-2)] p-3 t-11 font-mono leading-[17px] text-[var(--fg-4)]">
               <Path label="配置" value={env?.configPath} />
-              <Path label="根目录" value={env?.projectRoot} />
+              <Path
+                label="程序目录"
+                value={`${env?.productRoot || env?.projectRoot || ""}${
+                  env?.productRootAuto ? "（自动）" : ""
+                }`}
+              />
               <Path label="工作区" value={env?.comfyBase} />
-              <Path label="提示词" value={`${env?.projectRoot || ""}\\engine\\prompts`} />
+              <Path label="提示词" value={env?.promptsDir || `${env?.projectRoot || ""}\\engine\\prompts`} />
               <div className="flex gap-2">
                 <span className="w-12 shrink-0 text-[var(--fg-3)]">ffmpeg</span>
                 <span className={env?.ffmpegReady ? "text-[var(--ok)]" : "text-[var(--err)]"}>
@@ -394,7 +400,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
               <div className="flex gap-2">
                 <span className="w-12 shrink-0 text-[var(--fg-3)]">节点</span>
                 <span className={env?.nodesInstalled ? "text-[var(--ok)]" : "text-[var(--err)]"}>
-                  {env?.nodesInstalled ? "已就绪" : "缺失"}
+                  {env?.nodesInstalled ? "已就绪（模板内置，目录里那份可改）" : "缺失"}
                 </span>
               </div>
             </div>

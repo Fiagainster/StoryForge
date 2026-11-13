@@ -31,7 +31,14 @@ export interface ChatMessage {
 
 export interface EnvReport {
   configPath: string;
+  /** 程序自己的运行时目录（安装版在 %APPDATA%\com.storyforge.desktop\root） */
   projectRoot: string;
+  /** 同上，语义更准确的新名字 */
+  productRoot?: string;
+  /** true = 用的是自动数据目录（安装版常态，不需要用户管） */
+  productRootAuto?: boolean;
+  /** 提示词副本目录（模板已内置，这里只是可改的那份） */
+  promptsDir?: string;
   /** 工作区目录（原 ComfyUI base，产物仍在它的 output/ 下） */
   comfyDir: string;
   comfyBase: string;
@@ -211,7 +218,10 @@ export interface ChatSession {
 }
 
 export interface AppConfig {
+  /** v1 遗留字段，现在只做兼容读，不再参与目录判定 */
   projectRoot: string;
+  /** 程序自己的运行时目录；留空 = 自动（安装版用 AppData） */
+  productRoot?: string;
   comfyDir: string;
   comfyBase: string;
   comfyPort: number;

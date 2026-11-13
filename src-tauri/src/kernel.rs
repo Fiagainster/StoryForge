@@ -146,24 +146,16 @@ struct VideoVal {
 }
 
 // ---------------------------------------------------------------------------
-// 提示词资产：engine/prompts/*.json，缺失时退回内置默认
+// 提示词资产：优先读 engine/prompts/*.json（可改），缺失则用编译进二进制的同一份
+//
+// 早先这里是手写的"精简版"兜底，比真文件短一截——安装版没有 prompts 目录时
+// 就会静默降级成低配提示词，画面质量掉了还查不出来。改成 include_str! 之后，
+// 装到任何机器上跑的都是同一套词，文件只是给人改的副本。
 // ---------------------------------------------------------------------------
 
-const BIBLE_FALLBACK: &str = r#"{
-  "default_style": "竖屏 9:16 电影短剧画面，真实电影质感，冷调低饱和，浅景深，画面无文字无水印",
-  "character_sheet": "角色定妆照，单人，正面，纯色背景，柔和布光，细节清晰",
-  "frame_suffix": "竖屏 9:16 电影分镜，画面无文字无水印",
-  "continuity": "保持参考图中人物的五官、发型、服装与影调一致"
-}"#;
-
-const GRAMMAR_FALLBACK: &str = r#"{"shot_sizes": {}, "cameras": {}}"#;
-
-const NEGATIVE_FALLBACK: &str = r#"{
-  "default": "文字，字幕，水印，畸形手指，多余肢体，面部扭曲，低清晰度",
-  "character": "多人同框，重复人脸，杂乱背景",
-  "frame": "人物变形，服装不一致，场景错乱",
-  "video": "画面闪烁，人物变形，动作僵硬"
-}"#;
+pub const BIBLE_JSON: &str = include_str!("../prompts/style-bible.json");
+pub const GRAMMAR_JSON: &str = include_str!("../prompts/shot-grammar.json");
+pub const NEGATIVE_JSON: &str = include_str!("../prompts/negative.json");
 
 fn load_json_dir(dir: &Path, name: &str, fallback: &str) -> Value {
     for candidate in [dir.join(name)] {
@@ -2556,9 +2548,9 @@ async fn execute_node(
             _ => None,
         }
     };
-    let bible = load_json_dir(&ctx.prompts_dir, "style-bible.json", BIBLE_FALLBACK);
-    let grammar = load_json_dir(&ctx.prompts_dir, "shot-grammar.json", GRAMMAR_FALLBACK);
-    let negative = load_json_dir(&ctx.prompts_dir, "negative.json", NEGATIVE_FALLBACK);
+    let bible = load_json_dir(&ctx.prompts_dir, "style-bible.json", BIBLE_JSON);
+    let grammar = load_json_dir(&ctx.prompts_dir, "shot-grammar.json", GRAMMAR_JSON);
+    let negative = load_json_dir(&ctx.prompts_dir, "negative.json", NEGATIVE_JSON);
     let neg_default = negative["default"].as_str().unwrap_or("");
     fn str_of<'a>(v: &'a Value, k: &str) -> &'a str {
         v[k].as_str().unwrap_or("")

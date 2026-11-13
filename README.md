@@ -80,7 +80,12 @@
 
 ## 首次运行
 
-**安装包（推荐）**：从 [Releases](../../releases) 下载 `StoryForge_x.y.z_x64-setup.exe`，双击安装即用——内核、ffmpeg 全部内置，无需 Python、无需 ComfyUI、无本地模型。
+**安装包（推荐）**：从 [Releases](../../releases) 下载 `StoryForge_x.y.z_x64-setup.exe`，双击安装即用——内核、ffmpeg、提示词模板全部内置，无需 Python、无需 ComfyUI、无本地模型。
+
+安装版是自包含的：运行时数据（素材 / 产物 / 缓存 / 可改的提示词副本）放在
+`%APPDATA%\com.storyforge.desktop\root\engine\`，**不读也不写你装程序的文件夹**，
+更不会去找源码目录。想换位置就在设置里填「程序目录」（必须是带 `engine/` 的目录，
+留空 = 自动）；把整个产品目录连 `engine/` 一起拷到 U 盘也能直接跑（免安装）。
 
 **开发模式**：
 
@@ -212,6 +217,7 @@ ARK Key 也可以读环境变量 `ARK_API_KEY`（内核每次提交前都会读�
 |---|---|
 | 生成产物 | `engine/workspace/output/` |
 | 画布节点现场 + 续跑缓存 | `engine/workspace/output/_run/`（`{节点id}.png\|mp4` + `cache.json`，删 `cache.json` = 忘掉一切、下次全跑） |
+| 程序目录（安装版） | `%APPDATA%\com.storyforge.desktop\root\`，首次启动自动铺好；开发模式则是仓库根 |
 | 项目数据 | 项目根目录（默认 `D:/StoryForgeProjects/`，可在设置里换）下的 `<项目名>/project.json`，落盘时自动留最近 3 份 `.bak` |
 | 导出成片 / 分镜表 | `<项目名>/export/` |
 | 界面配置 | 系统配置目录 `com.storyforge.desktop/config.json` |
