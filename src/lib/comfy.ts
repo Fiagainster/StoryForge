@@ -26,6 +26,8 @@ export interface WatchEvent {
   /** 0–1 */
   pct?: number;
   detail?: string;
+  /** 这个节点刚产出的文件（`_run/` 下的固定文件名），画布直接拿来显示 */
+  file?: { filename: string; subfolder?: string; kind?: string };
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -50,11 +52,16 @@ export class ComfyClient {
     return {};
   }
 
-  async queuePrompt(graph: ComfyGraph, clientId: string): Promise<string> {
+  async queuePrompt(
+    graph: ComfyGraph,
+    clientId: string,
+    opts?: { forceNodes?: string }
+  ): Promise<string> {
     try {
       const data = await invoke<{ prompt_id: string }>("kernel_submit_cmd", {
         graph,
         clientId,
+        forceNodes: opts?.forceNodes,
       });
       if (!data?.prompt_id) throw new Error("内核未返回 prompt_id");
       return data.prompt_id;
@@ -103,6 +110,9 @@ export class ComfyClient {
         for (const f of arr) {
           if (!f?.filename) continue;
           const meta = (f as any)?.metadata;
+          // 内核给每个节点在 _run/ 留了一份现场副本（画布上贴图用），
+          // 它不是"这一版的产物"，混进来会让分镜和花费重复计数
+          if (meta?.live) continue;
           list.push({
             filename: f.filename,
             subfolder: f.subfolder,
@@ -159,7 +169,20 @@ export class ComfyClient {
           }
           break;
         case "executed":
-          if (m.node) on({ kind: "nodeDone", node: String(m.node) });
+          if (m.node) {
+            const f = m.file as
+              | { filename?: string; subfolder?: string; kind?: string }
+              | null
+              | undefined;
+            on({
+              kind: "nodeDone",
+              node: String(m.node),
+              file:
+                f && typeof f.filename === "string"
+                  ? { filename: f.filename, subfolder: f.subfolder, kind: f.kind }
+                  : undefined,
+            });
+          }
           break;
         case "execution_success":
           on({ kind: "done" });

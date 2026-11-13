@@ -30,15 +30,24 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub const ARK_BASE: &str = "https://ark.cn-beijing.volces.com/api/v3";
 
+/// 阿里云百炼（DashScope）。注意：北京与新加坡是两个独立地域，
+/// API Key 与域名绑地域，跨地域调用必然鉴权失败。
+pub const DASHSCOPE_CN_BASE: &str = "https://dashscope.aliyuncs.com";
+/// 图生动作（动作迁移）：一张人物图 + 一段参考视频 → 该人物做视频里的动作。
+pub const WAN_ANIMATE_MODEL: &str = "wan2.2-animate-move";
+
 /// 内核认识的全部节点。图里出现不在这里的 class_type 直接拒收——
 /// 394 节点库的时代结束了，这条白名单就是新的执行边界。
 pub const KERNEL_NODES: &[&str] = &[
     "DramaCharacter",
+    "DramaBackdrop",
     "DramaShotFrame",
     "DramaShotVideo",
     "DramaContinuity",
     "StoryForgeSeedream",
     "StoryForgeSeedance",
+    "WanAnimate",
+    "VideoFit",
     "SaveImage",
     "SaveVideo",
     "EmptyImage",
@@ -240,6 +249,9 @@ struct RunCtx {
     video_provider: String,
     jimeng_ak: String,
     jimeng_sk: String,
+    /// 百炼（DashScope）：动作迁移专用。与 ARK 是两套 Key，不能混用
+    bailian_key: String,
+    bailian_base: String,
 }
 
 impl RunCtx {
@@ -256,6 +268,26 @@ impl RunCtx {
 
     fn emit_node(&self, kind: &str, node: &str) {
         self.emit(json!({ "type": kind, "node": node }));
+    }
+
+    /// 节点跑完：连同产物坐标一起推给前端，画布上这个节点立刻能显示缩略图。
+    /// 文件名是固定的 `_run/{nodeId}.png|mp4`，所以这里不用等历史查询。
+    fn emit_node_artifact(&self, node: &str, outs: &[NodeVal]) {
+        let mut file = Value::Null;
+        for v in outs {
+            match v {
+                NodeVal::Image(_) => {
+                    file = json!({ "filename": format!("{node}.png"), "subfolder": "_run", "kind": "image" });
+                    break;
+                }
+                NodeVal::Video(_) => {
+                    file = json!({ "filename": format!("{node}.mp4"), "subfolder": "_run", "kind": "video" });
+                    break;
+                }
+                NodeVal::Str(_) => {}
+            }
+        }
+        self.emit(json!({ "type": "executed", "node": node, "file": file }));
     }
 
     fn check_cancel(&self) -> Result<(), String> {
@@ -587,6 +619,294 @@ async fn ark_video(
     Ok(VideoVal { path, duration: None, provider: "ark".into(), planned: None })
 }
 
+// ---------------------------------------------------------------------------
+// 阿里云百炼：临时文件上传 + 图生动作（wan2.2-animate-move）
+//
+// 这条链路的两个坑在这里兜住：
+//   1) 模型只收公网 HTTP(S) 或 oss:// 临时地址。本地 mp4 必须先换临时地址；
+//      临时地址 48 小时过期，调用时还必须带 X-DashScope-OssResourceResolve: enable，
+//      少这个头会直接报错。
+//   2) 计费只按成功输出的秒数，输入不计费、失败不扣钱。所以前置校验要做死
+//      （人物图 ≤5MB、参考视频 2~30s / ≤200MB / 边长 ≤2048），别把必然失败的请求发出去。
+// ---------------------------------------------------------------------------
+
+/// 百炼单次临时上传：getPolicy 取凭证 → OSS form 直传 → 返回 oss:// 临时地址
+async fn ds_upload(ctx: &RunCtx, bytes: &[u8], filename: &str) -> Result<String, String> {
+    if ctx.bailian_key.trim().is_empty() {
+        return Err("未配置百炼 API Key（设置 → 百炼 → API Key），动作迁移跑不了".into());
+    }
+    let resp = ctx
+        .http
+        .get(format!("{}/api/v1/uploads", ctx.bailian_base))
+        .bearer_auth(ctx.bailian_key.trim())
+        .query(&[("action", "getPolicy"), ("model", WAN_ANIMATE_MODEL)])
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await
+        .map_err(|e| format!("百炼上传凭证请求失败：{e}"))?;
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    if status >= 400 {
+        return Err(format!("百炼上传凭证失败 HTTP {status}: {}", truncate(&text, 300)));
+    }
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("上传凭证解析失败：{e}"))?;
+    let policy = v
+        .get("data")
+        .cloned()
+        .ok_or_else(|| format!("上传凭证缺少 data：{}", truncate(&text, 300)))?;
+    let field = |k: &str| -> String {
+        policy.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
+    };
+    let upload_dir = field("upload_dir");
+    let upload_host = field("upload_host");
+    if upload_host.is_empty() || upload_dir.is_empty() {
+        return Err(format!("上传凭证字段不全：{}", truncate(&policy.to_string(), 300)));
+    }
+    // 文件名只留 ASCII：中文名在 OSS key 里会被二次编码，回填 oss:// 后反而认不到
+    let safe_name: String = filename
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let key = format!("{}/{}", upload_dir.trim_end_matches('/'), safe_name);
+    let boundary = format!("----storyforge{}", new_prompt_id().replace('-', ""));
+    let mut body: Vec<u8> = Vec::new();
+    for (name, value) in [
+        ("OSSAccessKeyId", field("oss_access_key_id")),
+        ("Signature", field("signature")),
+        ("policy", field("policy")),
+        ("x-oss-object-acl", field("x_oss_object_acl")),
+        ("x-oss-forbid-overwrite", field("x_oss_forbid_overwrite")),
+        ("key", key.clone()),
+        ("success_action_status", "200".to_string()),
+    ] {
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n")
+                .as_bytes(),
+        );
+        body.extend_from_slice(value.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{safe_name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+    let up = ctx
+        .http
+        .post(&upload_host)
+        .header("Content-Type", format!("multipart/form-data; boundary={boundary}"))
+        .body(body)
+        .timeout(Duration::from_secs(600))
+        .send()
+        .await
+        .map_err(|e| format!("上传到百炼临时空间失败：{e}"))?;
+    let up_status = up.status().as_u16();
+    if up_status >= 400 {
+        let t = up.text().await.unwrap_or_default();
+        return Err(format!("上传到百炼临时空间失败 HTTP {up_status}: {}", truncate(&t, 300)));
+    }
+    Ok(format!("oss://{key}"))
+}
+
+/// 查一次百炼任务状态
+async fn ds_task(ctx: &RunCtx, task_id: &str) -> Result<Value, String> {
+    let resp = ctx
+        .http
+        .get(format!("{}/api/v1/tasks/{task_id}", ctx.bailian_base))
+        .bearer_auth(ctx.bailian_key.trim())
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await
+        .map_err(|e| format!("百炼任务查询失败：{e}"))?;
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    if status >= 400 {
+        return Err(format!("百炼任务查询失败 HTTP {status}: {}", truncate(&text, 250)));
+    }
+    serde_json::from_str(&text).map_err(|e| format!("百炼任务响应解析失败：{e}"))
+}
+
+/// 图生动作：人物图 + 参考视频 → 动作迁移视频
+#[allow(clippy::too_many_arguments)]
+async fn wan_animate(
+    ctx: &RunCtx,
+    node: &str,
+    image: Option<&ImageVal>,
+    image_url: &str,
+    video: &VideoVal,
+    mode: &str,
+    check_image: bool,
+    watermark: bool,
+) -> Result<VideoVal, String> {
+    let mode = if mode.trim().is_empty() { "wan-pro" } else { mode.trim() };
+    if mode != "wan-std" && mode != "wan-pro" {
+        return Err(format!(
+            "wan2.2-animate-move 的 mode 只能是 wan-std / wan-pro，收到 {mode}"
+        ));
+    }
+
+    // ---- 人物图：有字节就上传（最可靠，不赌跨云拉取），否则退回公网地址 ----
+    let img_url = {
+        if let Some(i) = image {
+            if i.bytes.len() > 5 * 1024 * 1024 {
+                return Err(format!(
+                    "人物图 {:.1}MB 超过 5MB 上限，先压一下",
+                    i.bytes.len() as f64 / 1048576.0
+                ));
+            }
+            ctx.emit(json!({ "type": "progress", "node": node, "detail": "上传人物图到百炼临时空间" }));
+            ds_upload(ctx, &i.bytes, "character.png").await?
+        } else {
+            let src = image_url.trim();
+            if src.starts_with("http://") || src.starts_with("https://") || src.starts_with("oss://") {
+                src.to_string()
+            } else {
+                return Err("动作迁移缺少人物图（接「角色定妆」的 IMAGE 输出）".into());
+            }
+        }
+    };
+
+    // ---- 参考视频：本地文件一律上传 ----
+    if !video.path.exists() {
+        return Err(format!("参考视频不存在：{}", video.path.display()));
+    }
+    let size_bytes = std::fs::metadata(&video.path).map(|m| m.len()).unwrap_or(0);
+    if size_bytes > 200 * 1024 * 1024 {
+        return Err(format!(
+            "参考视频 {:.1}MB 超过 200MB 上限，先用「视频规整」压一遍",
+            size_bytes as f64 / 1048576.0
+        ));
+    }
+    if let Some(d) = video.duration.or_else(|| ffprobe_duration(&ctx.ffprobe, &video.path)) {
+        if d < 2.0 || d > 30.0 {
+            return Err(format!(
+                "参考视频 {d:.1}s 超出模型 2~30 秒限制（用「视频规整」裁到范围内）"
+            ));
+        }
+    }
+    ctx.emit(json!({ "type": "progress", "node": node, "detail": "上传参考视频到百炼临时空间" }));
+    let video_bytes = std::fs::read(&video.path).map_err(|e| format!("读参考视频失败：{e}"))?;
+    let vid_url = ds_upload(ctx, &video_bytes, "motion.mp4").await?;
+
+    // ---- 提交任务 ----
+    let body = json!({
+        "model": WAN_ANIMATE_MODEL,
+        "input": { "image_url": img_url, "video_url": vid_url, "watermark": watermark },
+        "parameters": { "mode": mode, "check_image": check_image }
+    });
+    let resp = ctx
+        .http
+        .post(format!(
+            "{}/api/v1/services/aigc/image2video/video-synthesis",
+            ctx.bailian_base
+        ))
+        .bearer_auth(ctx.bailian_key.trim())
+        .header("X-DashScope-Async", "enable")
+        .header("X-DashScope-OssResourceResolve", "enable")
+        .json(&body)
+        .timeout(Duration::from_secs(120))
+        .send()
+        .await
+        .map_err(|e| format!("百炼任务提交失败：{e}"))?;
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    if status >= 400 {
+        return Err(format!("百炼任务提交失败 HTTP {status}: {}", truncate(&text, 500)));
+    }
+    let created: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("百炼响应解析失败：{e}｜{}", truncate(&text, 200)))?;
+    let task_id = created
+        .pointer("/output/task_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("百炼未返回 task_id：{}", truncate(&created.to_string(), 400)))?
+        .to_string();
+
+    // ---- 轮询：官方建议 15s 一次，20 秒片子大约 1~5 分钟出来 ----
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
+    let started = std::time::Instant::now();
+    let mut poll_fails = 0u32;
+    let mut last_status = String::new();
+    let mut video_url = String::new();
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        ctx.check_cancel()?;
+        let info = match ds_task(ctx, &task_id).await {
+            Ok(v) => {
+                poll_fails = 0;
+                v
+            }
+            Err(e) => {
+                poll_fails += 1;
+                if poll_fails >= 3 {
+                    return Err(format!("百炼查询连续失败 {poll_fails} 次，放弃等待（task {task_id}）：{e}"));
+                }
+                ctx.emit(json!({
+                    "type": "progress", "node": node,
+                    "detail": format!("查询抖动（{poll_fails}/3），继续等待：{}", truncate(&e, 120)),
+                }));
+                continue;
+            }
+        };
+        let st = info
+            .pointer("/output/task_status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !st.is_empty() {
+            last_status = st.clone();
+            let secs = started.elapsed().as_secs();
+            ctx.emit(json!({
+                "type": "progress", "node": node,
+                "detail": format!("动作迁移中 · {secs}s · {st}")
+            }));
+        }
+        if st == "SUCCEEDED" {
+            video_url = info
+                .pointer("/output/results/video_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            break;
+        }
+        if st == "FAILED" || st == "CANCELED" || st == "UNKNOWN" {
+            return Err(format!(
+                "动作迁移任务 {st}：{}",
+                truncate(&info.to_string(), 600)
+            ));
+        }
+    }
+    if video_url.is_empty() {
+        return Err(format!(
+            "动作迁移超时（最后状态：{}）",
+            if last_status.is_empty() { "unknown" } else { &last_status }
+        ));
+    }
+
+    let bytes = download(ctx, &video_url).await?;
+    std::fs::create_dir_all(&ctx.tmp_dir).map_err(|e| e.to_string())?;
+    let path = ctx.tmp_dir.join(format!("wan_animate_{}.mp4", new_prompt_id()));
+    std::fs::write(&path, &bytes).map_err(|e| format!("落盘视频失败：{e}"))?;
+    let real_dur = ffprobe_duration(&ctx.ffprobe, &path);
+    Ok(VideoVal {
+        path,
+        duration: real_dur,
+        provider: "wan".into(),
+        planned: real_dur.map(|d| d.round() as i64),
+    })
+}
+
+
 trait UrlOpt {
     fn non_empty(&self) -> Option<&str>;
     /// 优先原始 URL，其次把图片转成 data URL
@@ -610,6 +930,273 @@ impl UrlOpt for &str {
 
 fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
+}
+
+// ---------------------------------------------------------------------------
+// 节点级产物 + 输入指纹缓存
+//
+// 目标只有一个：**随时停，随时接着跑**。
+//   - 每个节点一跑完就把产物写进 output/_run/ 并登记，画布上立刻能看到；
+//   - 节点指纹 = class_type + 排序后的输入（连线换成上游指纹），输入没变就不重跑；
+//   - 缓存落 cache.json，进程崩了、应用关了，下次仍然命中。
+// 花的钱只在真正执行时累加，命中的节点不记账。
+// ---------------------------------------------------------------------------
+
+fn run_dir(out_dir: &Path) -> PathBuf {
+    out_dir.join("_run")
+}
+
+fn load_run_cache(out_dir: &Path) -> Value {
+    std::fs::read_to_string(run_dir(out_dir).join("cache.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| json!({}))
+}
+
+fn save_run_cache(out_dir: &Path, cache: &Value) {
+    let dir = run_dir(out_dir);
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(
+        dir.join("cache.json"),
+        serde_json::to_string(cache).unwrap_or_default(),
+    );
+}
+
+/// 节点输入指纹。连线用上游指纹替代，所以上游一变，下游自动失效。
+/// 文件类输入附加 size+mtime——换了同名文件也能识别出来。
+fn node_signature(
+    id: &str,
+    nodes: &HashMap<String, NodeDef>,
+    sigs: &HashMap<String, String>,
+    salt: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let Some(def) = nodes.get(id) else {
+        return String::new();
+    };
+    let mut parts: Vec<String> = vec![def.class_type.clone()];
+    if let Some(obj) = def.inputs.as_object() {
+        let mut keys: Vec<&String> = obj.keys().collect();
+        keys.sort();
+        for k in keys {
+            let v = &obj[k];
+            let piece = if is_link(v) {
+                let up = v.get(0).and_then(|x| x.as_str()).unwrap_or("");
+                let slot = v.get(1).and_then(|x| x.as_i64()).unwrap_or(0);
+                format!("{k}=<{}#{slot}>", sigs.get(up).cloned().unwrap_or_default())
+            } else {
+                format!("{k}={v}")
+            };
+            parts.push(piece);
+        }
+    }
+    if !salt.is_empty() {
+        parts.push(format!("#force={salt}"));
+    }
+    let mut h = Sha256::new();
+    h.update(parts.join("\n").as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+/// 节点产物即时落盘：固定文件名（{nodeId}.png / .mp4），重跑就覆盖，不堆垃圾。
+/// 落盘之后画布和资产页都能按 outputs 里的记录直接显示。
+fn persist_node_outputs(ctx: &RunCtx, node: &str, outs: &[NodeVal]) {
+    let dir = run_dir(&ctx.out_dir);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    for v in outs {
+        match v {
+            NodeVal::Image(img) => {
+                let fname = format!("{node}.png");
+                if std::fs::write(dir.join(&fname), &img.bytes).is_ok() {
+                    ctx.record_output(
+                        node,
+                        "images",
+                        json!({
+                            "filename": fname, "subfolder": "_run", "type": "output",
+                            "metadata": { "kind": "image", "live": true }
+                        }),
+                    );
+                }
+            }
+            NodeVal::Video(vid) => {
+                let fname = format!("{node}.mp4");
+                if !vid.path.exists() {
+                    continue;
+                }
+                if std::fs::copy(&vid.path, dir.join(&fname)).is_ok() {
+                    ctx.record_output(
+                        node,
+                        "videos",
+                        json!({
+                            "filename": fname, "subfolder": "_run", "type": "output",
+                            "metadata": {
+                                "kind": "video", "live": true,
+                                "duration": vid.duration.unwrap_or(0.0)
+                            }
+                        }),
+                    );
+                }
+            }
+            NodeVal::Str(_) => {}
+        }
+    }
+}
+
+/// 这个节点这次必须重算吗？
+///   - 被点名强制重跑（含 `*` 整图）；
+///   - 或者它的上游这次被强制重跑过——上游换了产物，下游手里那份已经过期。
+fn node_must_run(
+    nid: &str,
+    nodes: &HashMap<String, NodeDef>,
+    force: &[&str],
+    dirty: &std::collections::HashSet<String>,
+) -> bool {
+    if force.iter().any(|f| *f == "*" || *f == nid) {
+        return true;
+    }
+    nodes
+        .get(nid)
+        .and_then(|d| d.inputs.as_object())
+        .map(|obj| {
+            obj.values().any(|v| {
+                is_link(v)
+                    && v.get(0)
+                        .and_then(|x| x.as_str())
+                        .map(|up| dirty.contains(up))
+                        .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// 把节点产物按指纹存进缓存（沿用同一个 sig 去重，同输入只留一份）
+fn cache_store(dir: &Path, cache: &mut Value, sig: &str, outs: &[NodeVal]) {
+    if sig.len() < 12 || outs.is_empty() {
+        return;
+    }
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let short = &sig[..12];
+    let mut list: Vec<Value> = Vec::new();
+    let mut provider = String::new();
+    let mut duration = 0.0f64;
+    for (i, v) in outs.iter().enumerate() {
+        match v {
+            NodeVal::Image(img) => {
+                let f = format!("{short}_{i}.png");
+                if std::fs::write(dir.join(&f), &img.bytes).is_err() {
+                    return;
+                }
+                list.push(json!({ "k": "image", "f": f }));
+            }
+            NodeVal::Video(vid) => {
+                let f = format!("{short}_{i}.mp4");
+                if !vid.path.exists() || std::fs::copy(&vid.path, dir.join(&f)).is_err() {
+                    return;
+                }
+                provider = vid.provider.clone();
+                duration = vid.duration.unwrap_or(0.0);
+                list.push(json!({ "k": "video", "f": f }));
+            }
+            NodeVal::Str(s) => list.push(json!({ "k": "str", "v": s })),
+        }
+    }
+    if list.is_empty() {
+        return;
+    }
+    cache[sig] = json!({ "outs": list, "provider": provider, "duration": duration });
+}
+
+/// 命中缓存：把磁盘产物读回成节点值。槽位顺序与当初输出一致，下游不会错位。
+fn cache_restore(dir: &Path, cache: &Value, sig: &str) -> Option<Vec<NodeVal>> {
+    if sig.len() < 12 {
+        return None;
+    }
+    let entry = cache.get(sig)?;
+    let list = entry.get("outs")?.as_array()?;
+    let provider = entry
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("cache")
+        .to_string();
+    let duration = entry.get("duration").and_then(|v| v.as_f64());
+    let mut out: Vec<NodeVal> = Vec::new();
+    for item in list {
+        let kind = item.get("k").and_then(|v| v.as_str()).unwrap_or("");
+        match kind {
+            "image" => {
+                let f = item.get("f").and_then(|v| v.as_str())?;
+                let bytes = std::fs::read(dir.join(f)).ok()?;
+                out.push(NodeVal::Image(Arc::new(ImageVal {
+                    bytes,
+                    mime: "image/png".into(),
+                    source_url: String::new(),
+                })));
+            }
+            "video" => {
+                let f = item.get("f").and_then(|v| v.as_str())?;
+                let p = dir.join(f);
+                if !p.exists() {
+                    return None;
+                }
+                out.push(NodeVal::Video(Arc::new(VideoVal {
+                    path: p,
+                    duration,
+                    provider: provider.clone(),
+                    planned: None,
+                })));
+            }
+            "str" => out.push(NodeVal::Str(
+                item.get("v").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            )),
+            _ => return None,
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// 素材查找：先 input/，再递归 output/。
+/// 目的是让「刚生成的定妆图」被下一轮动作迁移直接复用，不用手动搬文件。
+fn find_asset(ws: &Path, name: &str) -> Option<PathBuf> {
+    if name.is_empty() {
+        return None;
+    }
+    let direct = ws.join("input").join(name);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let out_direct = ws.join("output").join(name);
+    if out_direct.is_file() {
+        return Some(out_direct);
+    }
+    fn walk(dir: &Path, name: &str, depth: u32) -> Option<PathBuf> {
+        if depth == 0 {
+            return None;
+        }
+        for e in std::fs::read_dir(dir).ok()?.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if p.file_name().map(|n| n.to_string_lossy() == "_trash").unwrap_or(false) {
+                    continue;
+                }
+                if let Some(f) = walk(&p, name, depth - 1) {
+                    return Some(f);
+                }
+            } else if p.file_name().map(|n| n.to_string_lossy() == name).unwrap_or(false) {
+                return Some(p);
+            }
+        }
+        None
+    }
+    walk(&ws.join("output"), name, 4)
 }
 
 // ---------------------------------------------------------------------------
@@ -1205,6 +1792,13 @@ const SEEDREAM_REF_CNY: f64 = 0.02;
 
 /// Seedance 输出单价（元/秒，输入不含视频；480p/720p/1080p）
 const SEEDANCE_CNY_PER_SEC: &[(&str, f64)] = &[("480p", 0.67), ("720p", 1.51), ("1080p", 3.74)];
+
+/// 万相图生动作（百炼 wan2.2-animate-move）单价：元/秒，只按成功输出秒数计费，
+/// 输入不计费、失败不扣钱。北京地域价（新加坡地域约为其 2.2 倍）。
+const WAN_ANIMATE_CNY_PER_SEC: &[(&str, f64)] = &[("wan-std", 0.4), ("wan-pro", 0.6)];
+/// 估算兜底时长：图里拿不到参考视频真实时长时按 5 秒估（真要花多少钱以实际输出为准）
+const WAN_ANIMATE_EST_SECONDS: f64 = 5.0;
+
 /// duration=-1（自动时长）时的估算时长
 const SEEDANCE_AUTO_DURATION_S: f64 = 15.0;
 /// 重试缓冲上界：每镜最坏 1+AUDIT_MAX_RETRY 次全价生成，"含重试缓冲至多 ¥X" 必须是真上界。
@@ -1253,6 +1847,17 @@ fn video_unit_cost(model: &str, resolution: &str, duration: i64) -> f64 {
     per_sec * tier * secs
 }
 
+/// 万相图生动作单条成本（元）：按输出秒数 × 模式单价
+fn wan_animate_cost(mode: &str, seconds: f64) -> f64 {
+    let per = WAN_ANIMATE_CNY_PER_SEC
+        .iter()
+        .find(|(m, _)| *m == mode.trim())
+        .map(|(_, p)| *p)
+        .unwrap_or(0.6);
+    let secs = if seconds > 0.0 { seconds } else { WAN_ANIMATE_EST_SECONDS };
+    per * secs
+}
+
 /// 单节点成本（元）；本地 ffmpeg 节点 0 元
 fn node_unit_cost(def: &NodeDef) -> f64 {
     let model = || {
@@ -1268,7 +1873,25 @@ fn node_unit_cost(def: &NodeDef) -> f64 {
             .count()
     };
     match def.class_type.as_str() {
+        "WanAnimate" => {
+            let mode = def
+                .inputs
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("wan-pro");
+            // duration=0 表示跟随参考视频真实时长；估算阶段只有静态图，按兜底秒数算
+            let secs = def
+                .inputs
+                .get("duration")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            wan_animate_cost(mode, if secs <= 0 { 0.0 } else { secs as f64 })
+        }
         "DramaCharacter" => {
+            let size = def.inputs.get("size").and_then(|v| v.as_str()).unwrap_or("");
+            image_unit_cost(&model(), size, ref_count(&["reference_image", "backdrop"]))
+        }
+        "DramaBackdrop" => {
             let size = def.inputs.get("size").and_then(|v| v.as_str()).unwrap_or("");
             image_unit_cost(&model(), size, 0)
         }
@@ -1956,13 +2579,75 @@ async fn execute_node(
             } else {
                 style.trim()
             };
+            // 参考图顺序很关键：人脸在前、背景在后，提示词按这个顺序说话。
+            // move 模式保留的是**人物图**的背景，所以场景必须画进这张图里——
+            // 这不是后期合成，是让模型一开始就在对的场景里生成人。
+            let face = upstream(id, "reference_image", 0, nodes, produced).and_then(|v| img(Some(v)));
+            let backdrop = upstream(id, "backdrop", 0, nodes, produced).and_then(|v| img(Some(v)));
+            let has_face = face.is_some();
+            let has_bg = backdrop.is_some();
+            let mut refs: Vec<ImageVal> = Vec::new();
+            if let Some(f) = face {
+                refs.push(f);
+            }
+            if let Some(b) = backdrop {
+                refs.push(b);
+            }
+
+            let mut parts: Vec<String> = vec![
+                style_prefix.to_string(),
+                format!("角色定妆照：{}", name.trim()),
+            ];
+            if has_face {
+                parts.push("以参考图 1 中人物的五官、脸型、肤色与气质为准，保持同一张脸".into());
+            }
+            parts.push(format!("造型与服装：{}", anchor.trim()));
+            if has_bg {
+                let idx = if has_face { 2 } else { 1 };
+                parts.push(format!(
+                    "人物完整地站在参考图 {idx} 的场景中，沿用该场景的背景内容、空间透视、光源方向与色温"
+                ));
+                parts.push("背景保持场景原貌，人物与场景的光影自然融合，背景适度虚化以突出人物".into());
+            }
+            parts.push(format!("{}构图", framing));
+            parts.push("单人全身，正面朝向镜头，面部清晰可见，服装细节完整，脚部不裁切".into());
+            let prompt = join_prompt(&parts.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+            let neg = join_prompt(&[neg_default, str_of(&negative, "character")]);
+            let image = ark_image(
+                ctx,
+                &prompt,
+                &inp_str("model"),
+                &inp_str("size"),
+                &refs,
+                &neg,
+                inp_bool("watermark"),
+            )
+            .await?;
+            let url = image.source_url.clone();
+            Ok(vec![NodeVal::Image(Arc::new(image)), NodeVal::Str(url)])
+        }
+
+        /* 空镜背景：先定场景，再让定妆图把人物放进这个场景。
+           这张图是「背景唯一真相」，同一个项目复用同一张，跨镜头才不跳。 */
+        "DramaBackdrop" => {
+            let scene = inp_str("scene");
+            if scene.trim().is_empty() {
+                return Err("背景生成缺少 scene（场景描述）".into());
+            }
+            let style = inp_str("style");
+            let style_prefix = if style.trim().is_empty() {
+                str_of(&bible, "default_style")
+            } else {
+                style.trim()
+            };
             let prompt = join_prompt(&[
                 style_prefix,
-                &format!("角色定妆照：{}，{}", name.trim(), anchor.trim()),
-                &format!("{}构图", framing),
-                str_of(&bible, "character_sheet"),
+                &format!("空镜背景：{}", scene.trim()),
+                "画面里没有任何人物、人影或人体剪影，只有场景本身",
+                "电影级景深，柔和氛围光，空气中有薄雾与光斑，古典雅致",
+                "画面无文字无水印",
             ]);
-            let neg = join_prompt(&[neg_default, str_of(&negative, "character")]);
+            let neg = join_prompt(&[neg_default, "人物，人影，肖像，人脸，人体，文字，水印"]);
             let image = ark_image(
                 ctx,
                 &prompt,
@@ -2188,6 +2873,103 @@ async fn execute_node(
             Ok(vec![NodeVal::Video(Arc::new(val))])
         }
 
+        /* ---------------- 动作迁移：百炼 wan2.2-animate-move ---------------- */
+        "WanAnimate" => {
+            let v = video(upstream(id, "video", 0, nodes, produced)).ok_or(
+                "动作迁移缺少参考视频（接「加载视频」或「视频规整」的 VIDEO 输出）",
+            )?;
+            let person = img(upstream(id, "character", 0, nodes, produced));
+            // 定妆节点的第 2 输出是原始 URL，百炼更信这个（也省一次上传）
+            let person_url = as_string(upstream(id, "character_url", 1, nodes, produced));
+            let mode = inp_str("mode");
+            let check_image = def
+                .inputs
+                .get("check_image")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(true);
+            let watermark = inp_bool("watermark");
+            let val = wan_animate(
+                ctx,
+                id,
+                person.as_ref(),
+                &person_url,
+                &v,
+                &mode,
+                check_image,
+                watermark,
+            )
+            .await?;
+            Ok(vec![NodeVal::Video(Arc::new(val))])
+        }
+
+        /* ---------------- 视频规整：裁时长 / 压尺寸，喂给有硬限制的模型 ---------------- */
+        "VideoFit" => {
+            let v = video(upstream(id, "video", 0, nodes, produced))
+                .ok_or("视频规整缺少 video 输入")?;
+            let max_sec = def
+                .inputs
+                .get("max_seconds")
+                .and_then(|x| x.as_i64())
+                .unwrap_or(30)
+                .clamp(2, 30);
+            let max_w = def
+                .inputs
+                .get("max_width")
+                .and_then(|x| x.as_i64())
+                .unwrap_or(1080)
+                .clamp(200, 2048);
+            let dur = v
+                .duration
+                .or_else(|| ffprobe_duration(&ctx.ffprobe, &v.path))
+                .unwrap_or(max_sec as f64);
+            let take = dur.min(max_sec as f64);
+            let out = ctx.tmp_dir.join(format!("fit_{}.mp4", new_prompt_id()));
+            let take_s = format!("{take:.3}");
+            let vf = format!("scale='min(iw,{max_w})':-2");
+            let src = v.path.to_string_lossy().to_string();
+            let dest = out.to_string_lossy().to_string();
+            run_ffmpeg(
+                &ctx.ffmpeg,
+                &[
+                    "-y",
+                    "-ss",
+                    "0",
+                    "-t",
+                    take_s.as_str(),
+                    "-i",
+                    src.as_str(),
+                    "-vf",
+                    vf.as_str(),
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "20",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "128k",
+                    "-movflags",
+                    "+faststart",
+                    dest.as_str(),
+                ],
+            )?;
+            ctx.emit(json!({
+                "type": "progress", "node": id,
+                "detail": format!("视频规整：{dur:.1}s → {take:.1}s，宽上限 {max_w}px")
+            }));
+            let real = ffprobe_duration(&ctx.ffprobe, &out);
+            Ok(vec![NodeVal::Video(Arc::new(VideoVal {
+                path: out,
+                duration: real,
+                provider: "local".into(),
+                planned: None,
+            }))])
+        }
+
         /* ---------------- 像素杂活：ffmpeg ---------------- */
         "DramaContinuity" => {
             let v = video(upstream(id, "video", 0, nodes, produced))
@@ -2221,21 +3003,16 @@ async fn execute_node(
         }
 
         "LoadImage" => {
-            // 输入文件放在 workspace/input/ 下，inputs.image 是文件名
+            // 先找 input/，再递归找 output/：刚生成的定妆图能被下一轮直接复用，不用手动搬文件
             let name = inp_str("image");
             if name.trim().is_empty() {
                 return Err("加载图片缺少文件名".into());
             }
-            let path = ctx.tmp_dir // input 目录由 lib.rs 传进 out_dir 的兄弟目录，见 kernel_submit
-                .parent()
-                .map(|p| p.join("input").join(&name))
-                .unwrap_or_else(|| PathBuf::from(&name));
-            let bytes = std::fs::read(&path).map_err(|_| {
-                format!(
-                    "找不到输入图片：{}（请把文件放进工作区的 input 文件夹）",
-                    path.display()
-                )
+            let ws = ctx.tmp_dir.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+            let path = find_asset(&ws, name.trim()).ok_or_else(|| {
+                format!("找不到图片：{name}（请放进工作区 input/，或引用 output/ 里的产物文件名）")
             })?;
+            let bytes = std::fs::read(&path).map_err(|e| format!("读取图片失败：{e}"))?;
             let mime = match path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase().as_str() {
                 "jpg" | "jpeg" => "image/jpeg",
                 "webp" => "image/webp",
@@ -2249,17 +3026,10 @@ async fn execute_node(
             if name.trim().is_empty() {
                 return Err("加载视频缺少文件名".into());
             }
-            let path = ctx
-                .tmp_dir
-                .parent()
-                .map(|p| p.join("input").join(&name))
-                .unwrap_or_else(|| PathBuf::from(&name));
-            if !path.exists() {
-                return Err(format!(
-                    "找不到输入视频：{}（请把文件放进工作区的 input 文件夹）",
-                    path.display()
-                ));
-            }
+            let ws = ctx.tmp_dir.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+            let path = find_asset(&ws, name.trim()).ok_or_else(|| {
+                format!("找不到视频：{name}（请放进工作区 input/，或引用 output/ 里的产物文件名）")
+            })?;
             let duration = ffprobe_duration(&ctx.ffprobe, &path);
             Ok(vec![NodeVal::Video(Arc::new(VideoVal { path, duration, provider: "local".into(), planned: None }))])
         }
@@ -2386,7 +3156,12 @@ pub fn kernel_submit(
     video_provider: String,
     jimeng_ak: String,
     jimeng_sk: String,
+    bailian_key: String,
+    bailian_base: String,
+    // 强制重跑的节点 id，逗号分隔；`*` 表示整图强制重跑（重跑按钮用）
+    force_nodes: Option<String>,
 ) -> Result<Value, String> {
+    let force_nodes = force_nodes.unwrap_or_default();
     let nodes = parse_graph(&graph)?;
     let order = topo_order(&nodes)?;
 
@@ -2429,6 +3204,8 @@ pub fn kernel_submit(
         video_provider,
         jimeng_ak,
         jimeng_sk,
+        bailian_key,
+        bailian_base,
     });
 
     let pid = prompt_id.clone();
@@ -2452,8 +3229,38 @@ pub fn kernel_submit(
         let mut produced: HashMap<String, Vec<NodeVal>> = HashMap::new();
         let mut assets_counter: u64 = 0;
         let result: Result<(), String> = async {
+            // 指纹缓存：输入没变的节点直接复用磁盘产物，不重跑、不重复花钱
+            let force: Vec<&str> = force_nodes
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let mut sigs: HashMap<String, String> = HashMap::new();
+            let mut cache = load_run_cache(&ctx.out_dir);
+            // 被强制重跑的节点及其下游：这次不许吃缓存，必须重新算
+            let mut dirty: std::collections::HashSet<String> = std::collections::HashSet::new();
+
             for nid in &order {
                 ctx.check_cancel()?;
+                let sig = node_signature(nid, &nodes, &sigs, "");
+                sigs.insert(nid.clone(), sig.clone());
+                // 被点名重跑，或上游这次重跑过 → 这个节点不能复用旧产物
+                let must_run = node_must_run(nid, &nodes, &force, &dirty);
+                // 命中：这个节点上次跑过、输入没变，直接用磁盘上那份
+                if !must_run {
+                    if let Some(outs) = cache_restore(&run_dir(&ctx.out_dir), &cache, &sig) {
+                        persist_node_outputs(&ctx, nid, &outs);
+                        ctx.emit(json!({
+                            "type": "progress", "node": nid,
+                            "detail": "复用上次结果（输入没变，跳过执行）"
+                        }));
+                        ctx.emit_node_artifact(nid, &outs);
+                        produced.insert(nid.clone(), outs);
+                        continue;
+                    }
+                } else {
+                    dirty.insert(nid.clone());
+                }
                 ctx.emit_node("executing", nid);
                 let mut outs = execute_node(&ctx, nid, &nodes, &mut produced, &mut assets_counter)
                     .await
@@ -2478,8 +3285,25 @@ pub fn kernel_submit(
                                     _ => None,
                                 })
                                 .unwrap_or_else(|| ctx.video_provider.clone());
-                            *ctx.run.cost_actual.lock().unwrap() +=
-                                node_unit_cost_routed(def, &used_provider);
+                            // 动作迁移按真实输出秒数对账（估算阶段拿不到时长，只有跑完才知道）
+                            let spent = if def.class_type == "WanAnimate" {
+                                let real = outs
+                                    .iter()
+                                    .find_map(|v| match v {
+                                        NodeVal::Video(vid) => vid.duration,
+                                        _ => None,
+                                    })
+                                    .unwrap_or(0.0);
+                                let mode = def
+                                    .inputs
+                                    .get("mode")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("wan-pro");
+                                wan_animate_cost(mode, real)
+                            } else {
+                                node_unit_cost_routed(def, &used_provider)
+                            };
+                            *ctx.run.cost_actual.lock().unwrap() += spent;
                             let audit = audit_node_outputs(
                                 &ctx.ffmpeg,
                                 &ctx.ffprobe,
@@ -2539,8 +3363,12 @@ pub fn kernel_submit(
                         }
                     }
                 }
+                // 产物即时落盘 + 记指纹：中途停下也不丢，下次接着跑直接命中
+                persist_node_outputs(&ctx, nid, &outs);
+                cache_store(&run_dir(&ctx.out_dir), &mut cache, &sig, &outs);
+                save_run_cache(&ctx.out_dir, &cache);
+                ctx.emit_node_artifact(nid, &outs);
                 produced.insert(nid.clone(), outs);
-                ctx.emit_node("executed", nid);
             }
             Ok(())
         }
@@ -2987,5 +3815,169 @@ mod audit_tests {
         // 选 ark → 按 ARK 表
         let d = mk_def("DramaShotVideo", json!({"generate_audio": false}));
         assert!((node_unit_cost_routed(&d, "ark") - 7.55).abs() < 1e-9);
+    }
+
+    // ---------------- 断点续跑：指纹缓存 ----------------
+
+    /// 测试用：JSON 字符串 → 节点表（顺带走一遍 parse_graph 的校验）
+    fn nodes_of(src: &str) -> HashMap<String, NodeDef> {
+        let g: Value = serde_json::from_str(src).unwrap();
+        parse_graph(&g).unwrap()
+    }
+
+    #[test]
+    fn signature_is_stable_and_param_sensitive() {
+        let sigs = HashMap::new();
+        let a = nodes_of(
+            r#"{"1":{"class_type":"EmptyImage","inputs":{"width":720,"height":1280}}}"#,
+        );
+        let s1 = node_signature("1", &a, &sigs, "");
+        let s1_again = node_signature("1", &a, &sigs, "");
+        assert_eq!(s1, s1_again, "输入没变指纹必须稳定，否则每次点开始生成都全量重跑");
+        assert_eq!(s1.len(), 64, "SHA256 十六进制");
+
+        let b = nodes_of(
+            r#"{"1":{"class_type":"EmptyImage","inputs":{"width":721,"height":1280}}}"#,
+        );
+        assert_ne!(s1, node_signature("1", &b, &sigs, ""), "改一个参数必须换指纹");
+
+        // 输入顺序不参与指纹：JSON 键序变了不该当成新输入
+        let c = nodes_of(
+            r#"{"1":{"class_type":"EmptyImage","inputs":{"height":1280,"width":720}}}"#,
+        );
+        assert_eq!(s1, node_signature("1", &c, &sigs, ""), "键序不同不算输入变化");
+    }
+
+    #[test]
+    fn signature_propagates_to_downstream() {
+        // 1 出图 → 2 保存。上游 prompt 改了，下游指纹必须跟着变，
+        // 否则下游会一直捡旧产物，画布上看着像"改了没生效"
+        let chain = |p: &str| {
+            format!(
+                r#"{{"1":{{"class_type":"StoryForgeSeedream","inputs":{{"prompt":"{p}","model":"doubao-seedream-5-0-pro-260628","size":"1080x1920"}}}},"2":{{"class_type":"SaveImage","inputs":{{"images":["1",0],"filename_prefix":"storyforge/shot01"}}}}}}"#
+            )
+        };
+        let sig_of = |src: &str| {
+            let nodes = nodes_of(src);
+            let mut sigs: HashMap<String, String> = HashMap::new();
+            for id in ["1", "2"] {
+                let sig = node_signature(id, &nodes, &sigs, "");
+                sigs.insert(id.to_string(), sig);
+            }
+            (sigs["1"].clone(), sigs["2"].clone())
+        };
+        let (up1, down1) = sig_of(&chain("古风少女站在竹林中"));
+        let (up2, down2) = sig_of(&chain("古风少女站在雪山下"));
+        assert_ne!(up1, up2);
+        assert_ne!(down1, down2, "上游换了，下游不能还拿着旧图");
+        // 完全一样的图 → 下游指纹也一样（这才是能复用的前提）
+        let (up3, down3) = sig_of(&chain("古风少女站在竹林中"));
+        assert_eq!((up1.clone(), down1), (up3, down3));
+    }
+
+    #[test]
+    fn must_run_covers_force_and_downstream() {
+        let nodes = nodes_of(
+            r#"{"1":{"class_type":"EmptyImage","inputs":{"width":720,"height":1280}},"2":{"class_type":"SaveImage","inputs":{"images":["1",0]}}}"#,
+        );
+        let clean = std::collections::HashSet::new();
+        assert!(!node_must_run("2", &nodes, &[], &clean), "没点名就吃缓存");
+        assert!(node_must_run("2", &nodes, &["2"], &clean), "点名单节点要重跑");
+        assert!(node_must_run("2", &nodes, &["*"], &clean), "整图重跑");
+        assert!(!node_must_run("2", &nodes, &["3"], &clean), "点别的节点不该连坐");
+
+        let mut dirty = std::collections::HashSet::new();
+        dirty.insert("1".to_string());
+        assert!(node_must_run("2", &nodes, &[], &dirty), "上游重跑过，下游产物已过期");
+    }
+
+    #[test]
+    fn cache_roundtrip_image_and_refuses_missing_file() {
+        let dir = std::env::temp_dir().join(format!("sf_cache_{}", new_prompt_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cache = json!({});
+        let sig = "b".repeat(64);
+        let outs = vec![NodeVal::Image(Arc::new(ImageVal {
+            bytes: b"PNGDATA".to_vec(),
+            mime: "image/png".into(),
+            source_url: String::new(),
+        }))];
+
+        cache_store(&dir, &mut cache, &sig, &outs);
+        assert!(cache.get(&sig).is_some(), "存了就要有记录");
+
+        let back = cache_restore(&dir, &cache, &sig).expect("同一指纹必须命中");
+        match &back[0] {
+            NodeVal::Image(i) => assert_eq!(i.bytes, b"PNGDATA"),
+            _ => panic!("类型还原错了"),
+        }
+
+        // 人手动清了 output → 必须当成没命中重新跑，不能把坏数据喂给下游
+        std::fs::remove_file(dir.join(format!("{}_{}.png", &sig[..12], 0))).unwrap();
+        assert!(cache_restore(&dir, &cache, &sig).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_ignores_empty_or_short_keys() {
+        let dir = std::env::temp_dir().join(format!("sf_cache_{}", new_prompt_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cache = json!({});
+        let outs = vec![NodeVal::Str("hello".into())];
+        // 指纹算不出来（图里有未知节点之类）时不记账，免得以后被误命中
+        cache_store(&dir, &mut cache, "short", &outs);
+        assert_eq!(cache, json!({}));
+        assert!(cache_restore(&dir, &cache, "short").is_none());
+        // 空产物同理
+        cache_store(&dir, &mut cache, &"c".repeat(64), &[]);
+        assert_eq!(cache, json!({}));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_cache_persists_across_restart() {
+        let out = std::env::temp_dir().join(format!("sf_runcache_{}", new_prompt_id()));
+        std::fs::create_dir_all(&out).unwrap();
+        assert_eq!(load_run_cache(&out), json!({}), "没有 cache.json 时是空对象，不能崩");
+
+        let mut c = json!({});
+        c["deadbeef"] = json!({ "outs": [{ "k": "str", "v": "x" }] });
+        save_run_cache(&out, &c);
+        assert!(run_dir(&out).join("cache.json").exists());
+        assert_eq!(load_run_cache(&out)["deadbeef"], c["deadbeef"], "重启后要能读回来");
+
+        // 坏档（手改坏了 / 写到一半断电）当空缓存处理，不许 panic
+        std::fs::write(run_dir(&out).join("cache.json"), b"{ not json").unwrap();
+        assert_eq!(load_run_cache(&out), json!({}));
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn cache_skips_video_whose_file_vanished() {
+        let dir = std::env::temp_dir().join(format!("sf_cache_{}", new_prompt_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("tmp_src.mp4");
+        std::fs::write(&src, b"MP4").unwrap();
+        let sig = "d".repeat(64);
+        let outs = vec![NodeVal::Video(Arc::new(VideoVal {
+            path: src.clone(),
+            duration: Some(20.0),
+            provider: "wan".into(),
+            planned: Some(20),
+        }))];
+        let mut cache = json!({});
+        cache_store(&dir, &mut cache, &sig, &outs);
+        let back = cache_restore(&dir, &cache, &sig).expect("命中");
+        match &back[0] {
+            NodeVal::Video(v) => {
+                assert_eq!(v.duration, Some(20.0), "时长要一起存回来，画布和成本对账都靠它");
+                assert_eq!(v.provider, "wan");
+            }
+            _ => panic!("类型还原错了"),
+        }
+        std::fs::remove_file(dir.join(format!("{}_{}.mp4", &sig[..12], 0))).unwrap();
+        assert!(cache_restore(&dir, &cache, &sig).is_none(), "视频文件没了必须重跑");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

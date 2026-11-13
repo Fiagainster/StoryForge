@@ -27,6 +27,11 @@ export type { Budget };
 
 export function buildPlanPrompt(opts: {
   hasArkKey: boolean;
+  hasBailianKey?: boolean;
+  /** 工作区 input/ 里的素材：动作迁移必须用真实文件名，不能编 */
+  inputFiles?: { filename: string; kind: string }[];
+  /** 最近生成的图片（output/）：用户说「用刚才那张」时从这里取文件名 */
+  recentImages?: { filename: string }[];
   lastPlan?: DramaPlan | null;
   lessons?: string[];
   hasLastGraph?: boolean;
@@ -34,6 +39,25 @@ export function buildPlanPrompt(opts: {
   const videoRule = opts.hasArkKey
     ? `- 用户说「拍/镜头/视频/成片」时 mode 用 video，会出图并逐镜生成视频；只说「一张图/分镜/画面」时用 image。`
     : `- 当前没有配置 ARK Key，mode 只能是 image；reply 里提醒用户配置 Key 后才会真实生成。`;
+
+  // 素材清单：模型不知道 input/ 里有什么时一定会瞎编文件名，这条清单就是唯一真相
+  const assets = opts.inputFiles?.length
+    ? `\n## 工作区素材（input/，动作迁移只能引用这些）\n${opts.inputFiles
+        .map((f) => `- ${f.filename}（${f.kind === "video" ? "视频" : "图片"}）`)
+        .join("\n")}\n`
+    : `\n## 工作区素材（input/）\n目录里没有可用素材。用户要做动作迁移时，先让他把参考视频与人物参考图放进工作区 input/（设置页有「打开素材目录」），不要编造文件名。\n`;
+
+  const motionRule = opts.hasBailianKey
+    ? ""
+    : `\n注意：当前没有配置百炼 API Key，动作迁移跑不了。用户要做动作迁移时，先提醒他到设置页填百炼 Key（并在 reply 里说清楚），不要假装能跑。\n`;
+
+  // 最近产物：第二轮要复用上一轮的定妆图，模型必须知道真实文件名
+  const recent = opts.recentImages?.length
+    ? `\n## 最近生成的图（output/ 里，可直接填进 characterImage 复用）\n${opts.recentImages
+        .slice(0, 8)
+        .map((f) => `- ${f.filename}`)
+        .join("\n")}\n`
+    : "";
 
   const last = opts.lastPlan
     ? `\n## 上一版计划\n用户说「改一下」「再来一版」时基于它改；没有要求改的角色锚点必须逐字保留。\n${JSON.stringify(
@@ -108,6 +132,44 @@ ${NODES.map((n) => `${n.n} — ${n.d} · ${n.c}`).join("\n")}\n`
 ## 双方案（可选，有把握时才给）
 想给用户导演式的选择时，额外输出 "planB"：与 plan 同结构的一版完整计划，必须有明显的导演级差异（情绪弧线不同：如一版克制压抑、一版外放爆发；或节奏不同：如一版碎剪短镜、一版长镜缓推），不是只改几个词。只给一个方案时不要输出 planB。
 
+## 动作迁移（mode 用 "motion"，不是分镜）
+用户要「把这段视频里的动作搬到这个人身上」「舞蹈复刻」「照着这段跳」「换脸跳同一支舞」时，输出 motion 计划。动作由参考视频决定，你**不写**动作描述，也不生成分镜首帧：
+{
+  "reply": "一句中文",
+  "plan": {
+    "title": "片名",
+    "mode": "motion",
+    "style": "全片风格前缀：影调、光线、质感、画幅，逐字复用",
+    "characters": [
+      {"id": "c1", "name": "角色名", "anchor": "服装与造型（如：浅蓝交领广袖汉服、外罩月白薄纱、盘髻流苏发簪）；不要重写五官，脸由参考图锁定"}
+    ],
+    "motion": {
+      "referenceVideo": "dance.mp4",
+      "characterRef": "face.jpg",
+      "scene": "空镜场景：云海翻涌的仙山之巅，淡青薄雾，远处楼阁若隐若现",
+      "size": "1080x1920",
+      "stage": "stills",
+      "characterImage": "",
+      "animateMode": "wan-pro",
+      "checkImage": true,
+      "referenceSeconds": 20
+    },
+    "shots": [{"title": "动作迁移", "duration": 20}]
+  }
+}
+- **分两步走，默认先出图**：stage="stills" 只出空镜背景与定妆图，一个视频请求都不发；用户看完说「可以、跑视频」再把 stage 改成 "full"，并把上一轮定妆图文件名填进 characterImage 直接复用——不要重新生成定妆，那等于让他刚看的图作废。
+- characterImage 只能填「最近生成的图」清单里真实存在的文件名，不要编。
+- 用户没明说要直接出片时，**一律先给 stills**：图几毛钱，视频一条十几块，让他看过再花。
+- stage="stills" 时可以不带 referenceVideo（这一步不碰视频）。
+- referenceVideo / characterRef 只写文件名（不带目录），文件必须放在工作区 input/。用户没给文件名就先问他要，不要瞎编。
+- anchor 只写造型与服装。脸一致性靠参考图，写五官反而会让模型两边打架。
+- **背景走 scene 字段**：先出一张无人空镜，再让定妆图把人物放进这个场景。move 保留的是人物图背景，所以成片背景就是这张空镜——不需要抠像或合成。用户要「古风、仙气、换个场景」就把场景写具体（地点、时间、天气、氛围、材质）；用户说「就用原来的背景」就把 scene 留空。
+- size 必须与参考视频比例接近：竖屏素材用 1080x1920，横屏用 1920x1080。不确定就问用户，比例错了人物会被拉变形。
+- animateMode 默认 wan-pro（1080P/25fps，0.6 元/秒）；用户说"先看效果""省点钱"用 wan-std（720P/15fps，0.4 元/秒）。
+- 花了多少钱按参考视频秒数算：20 秒 pro 约 12 元、std 约 8 元。空镜背景与定妆图各约 0.3 元。报价直接说这个数。
+- 构图是死穴：定妆必须是全身、正面、人物在画面里的占比与参考视频接近。用户给半身照时明确告诉他这张会先被扩成全身，效果有折扣。
+- 参考视频里的人物若是白模/无五官素材，把 checkImage 设成 false 再试。
+
 ## 计划硬性规则
 - 默认克制：1-3 个镜头，不擅自加戏。用户明确要几镜就给几镜，不要替用户设上限——镜头数超出预算时会被自动截断，你只管按内容需要给够。
 - shotSize 只能是：大远景、远景、全景、中景、中近景、近景、特写、大特写。
@@ -127,7 +189,7 @@ ${NODES.map((n) => `${n.n} — ${n.d} · ${n.c}`).join("\n")}\n`
 - 不要输出 ComfyUI 节点、class_type、连线；只输出计划。
 - 计划会被编译成一张图放到画布上。所以 reply 里不要让人"确认参数"，只说明你把什么放到画布上了。
 - 用户想在现有分镜**后面加镜头**（"加一个镜头""再来一场""补一镜"，且画布上已有分镜）时：在 plan 同级加 "append": true，plan 的 shots 只写**新增**的镜头，已有镜头绝对不要重复写；已有角色逐字复用锚点，新角色才写进 characters。改已有镜头的参数用 ops，不要用 append。
-${videoRule}
+${videoRule}${motionRule}${recent}${assets}
 ${last}${lessons}${coEdit}`;
 }
 
@@ -251,7 +313,8 @@ async function submitAndWait(
   client: ComfyClient,
   cb: RunCallbacks,
   note?: string,
-  llmTokens = 0
+  llmTokens = 0,
+  forceNodes?: string
 ): Promise<RunRecord> {
   const log = cb.onLog || (() => {});
   const clientId =
@@ -326,8 +389,11 @@ async function submitAndWait(
     }
     cb.onNode?.(e);
   });
-  const promptId = await client.queuePrompt(graph, clientId);
-  log("info", `已提交执行，prompt_id=${promptId}`);
+  const promptId = await client.queuePrompt(graph, clientId, { forceNodes });
+  log(
+    "info",
+    `已提交执行，prompt_id=${promptId}${forceNodes ? `（强制重跑：${forceNodes}）` : "（上次跑过的节点直接复用）"}`
+  );
   let assets: Asset[] = [];
   let cost: { estimated: number; buffered: number; actual: number } | undefined;
   try {
@@ -382,6 +448,11 @@ interface CompileRunOptions {
   generateAudio?: boolean;
   /** 出计划那轮消耗的 LLM tokens，记进本次运行的用量 */
   llmTokens?: number;
+  /**
+   * 强制重跑的节点 id（逗号分隔，`*` = 整图）。
+   * 不传就走指纹缓存：输入没变的节点直接复用磁盘产物，不重复花钱。
+   */
+  forceNodes?: string;
 }
 
 /** 编译计划 → 校验 → 提交执行。确认门通过后（或免确认路径）都走这里。 */
@@ -472,7 +543,14 @@ async function compileAndRun(
     status: "running",
   });
   try {
-    const run = await submitAndWait(checked, client, cb, ctx.note, opts.llmTokens ?? 0);
+    const run = await submitAndWait(
+      checked,
+      client,
+      cb,
+      ctx.note,
+      opts.llmTokens ?? 0,
+      opts.forceNodes
+    );
     step({
       id: runStepId,
       kind: "tool",
@@ -552,6 +630,7 @@ export async function executePlan(
       videoResolution: opts.videoResolution,
       generateAudio: opts.generateAudio,
       llmTokens: opts.llmTokens,
+      forceNodes: opts.forceNodes,
     },
     client,
     // 自审不合格沉淀经验的出口接上调用方（store.addLearning）
@@ -804,6 +883,8 @@ export async function executeEditedGraph(
     hasModelKey?: boolean;
     /** 已沉淀的经验，修复时一并注入 */
     lessons?: string[];
+    /** 强制重跑的节点 id（逗号分隔，`*` = 整图）；不传就走指纹缓存 */
+    forceNodes?: string;
   }
 ): Promise<AgentResult> {
   const log = cb.onLog || (() => {});
@@ -827,7 +908,14 @@ export async function executeEditedGraph(
   }
   stage("生成中");
   try {
-    const run = await submitAndWait(checked, client, { ...cb, onLesson: opts?.onLesson }, note ?? "按画布执行", 0);
+    const run = await submitAndWait(
+      checked,
+      client,
+      { ...cb, onLesson: opts?.onLesson },
+      note ?? "按画布执行",
+      0,
+      opts?.forceNodes
+    );
     return {
       reply: `画布已执行（${Object.keys(checked).length} 个节点），产物在「分镜」里`,
       graph: checked,
@@ -1086,6 +1174,12 @@ export interface AgentOptions {
   budget?: Budget | null;
   /** 已沉淀的经验教训，注入计划提示词 */
   lessons?: string[];
+  /** 是否已配置百炼 Key（动作迁移依赖它） */
+  hasBailianKey?: boolean;
+  /** 工作区 input/ 里的素材清单，动作迁移只能引用这里的文件 */
+  inputFiles?: { filename: string; kind: string }[];
+  /** 最近生成的图（output/），用于「用刚才那张继续跑」时复用 */
+  recentImages?: { filename: string }[];
 }
 
 export interface AgentResult {
@@ -1213,6 +1307,9 @@ export async function runAgentTurn(
   stage("理解意图");
   const systemPrompt = buildPlanPrompt({
     hasArkKey,
+    hasBailianKey: !!opts.hasBailianKey,
+    inputFiles: opts.inputFiles,
+    recentImages: opts.recentImages,
     lastPlan: opts.lastPlan,
     lessons: opts.lessons,
     hasLastGraph: !!opts.lastGraph,

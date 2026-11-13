@@ -1016,6 +1016,7 @@ export function Workspace({ chatOpen, onOpenChat }: { chatOpen: boolean; onOpenC
     send,
     runNodes,
     runNow,
+    nodeArtifacts,
     swapPlanVariant,
     clearLogs,
     moveShot,
@@ -1300,11 +1301,12 @@ export function Workspace({ chatOpen, onOpenChat }: { chatOpen: boolean; onOpenC
                 baseGraph={runs[0]?.graph ?? null}
                 onGraphChange={setDraftGraph}
                 onFocusNode={focusNode}
-                onRun={() => void runDraft()}
+                onRun={(force) => void runDraft(force)}
                 onCancel={() => void cancelRun()}
                 onReset={resetDraft}
                 runNodes={runNodes}
                 runNow={runNow}
+                nodeArtifacts={nodeArtifacts}
               />
               <div className="space-y-1 pt-1">
                 <Disclosure title="原始 JSON" hint={`${Object.keys(draft.graph).length} 个节点`}>

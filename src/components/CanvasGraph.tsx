@@ -3,7 +3,8 @@ import { NODE_INDEX, NODES } from "../lib/nodeSearch";
 import { applyGraphOps } from "../lib/graphOps";
 import { diffSummary, touchedIds } from "../lib/graphAudit";
 import { useStore } from "../lib/store";
-import type { CanvasDoc, NodeRun } from "../lib/store";
+import type { CanvasDoc, NodeArtifact, NodeRun } from "../lib/store";
+import { mediaSrc } from "../lib/media";
 import type { ComfyGraph } from "../types";
 import { Btn, I, Spinner, Tag, cx } from "./ui";
 
@@ -24,6 +25,8 @@ const GRID = 8;
 const PORT_OFF = 8;
 /** 输出区与输入区之间的分隔线留白 */
 const OUT_GAP = 4;
+/** 节点底部那块产物缩略图的高度：图和视频都能看清楚，又不至于把画布撑爆 */
+const THUMB_H = 116;
 
 const MIN_K = 0.3;
 const MAX_K = 2.4;
@@ -163,13 +166,19 @@ function foldedRows(graph: ComfyGraph, id: string, expand?: Set<string>): string
 }
 
 /** 节点真实高度：可见行 + （有折叠时那一条「＋N」） + 输出区 */
-function nodeHeight(graph: ComfyGraph, id: string, expand?: Set<string>): number {
+function nodeHeight(
+  graph: ComfyGraph,
+  id: string,
+  expand?: Set<string>,
+  hasArt?: (id: string) => boolean
+): number {
   const node = graph[id];
   if (!node) return HEADER_H;
   const rows = inputRows(graph, id, expand).length + (foldedRows(graph, id, expand).length ? 1 : 0);
   const outs = outTypes(node.class_type).length;
-  if (!rows && !outs) return HEADER_H + 26;
-  return HEADER_H + rows * ROW_H + (outs ? OUT_GAP : 0) + outs * ROW_H;
+  const art = hasArt?.(id) ? THUMB_H : 0;
+  if (!rows && !outs) return HEADER_H + 26 + art;
+  return HEADER_H + rows * ROW_H + (outs ? OUT_GAP : 0) + outs * ROW_H + art;
 }
 
 /** 输入端口锚点：第 i 行左边缘外侧 */
@@ -194,7 +203,11 @@ function linkPath(a: Pos, b: Pos): string {
   return `M ${a.x} ${a.y} C ${a.x + dx} ${a.y}, ${b.x - dx} ${b.y}, ${b.x} ${b.y}`;
 }
 
-function computeLayout(graph: ComfyGraph, expand?: Set<string>): {
+function computeLayout(
+  graph: ComfyGraph,
+  expand?: Set<string>,
+  hasArt?: (id: string) => boolean
+): {
   positions: Record<string, Pos>;
   width: number;
   height: number;
@@ -228,12 +241,14 @@ function computeLayout(graph: ComfyGraph, expand?: Set<string>): {
     let y = PAD_X;
     for (const id of ids) {
       positions[id] = { x, y };
-      y += nodeHeight(graph, id, expand) + GAP_Y;
+      y += nodeHeight(graph, id, expand, hasArt) + GAP_Y;
     }
     width = Math.max(width, x + NODE_W + PAD_X);
   }
   const height = Math.max(
-    ...Object.keys(graph).map((id) => positions[id].y + nodeHeight(graph, id, expand) + PAD_X),
+    ...Object.keys(graph).map(
+      (id) => positions[id].y + nodeHeight(graph, id, expand, hasArt) + PAD_X
+    ),
     240
   );
   return { positions, width, height };
@@ -376,6 +391,7 @@ export function CanvasGraph({
   onReset,
   runNodes,
   runNow,
+  nodeArtifacts,
 }: {
   /** 画布的唯一来源：AI 改的、人改的、执行出来的，都是这一份 */
   doc: CanvasDoc;
@@ -388,8 +404,8 @@ export function CanvasGraph({
   baseGraph?: ComfyGraph | null;
   onFocusNode?: (id: string) => void;
   onGraphChange: (g: ComfyGraph) => void;
-  /** 唯一的生成入口 */
-  onRun: () => void;
+  /** 唯一的生成入口；传 true = 不吃缓存，全部重跑 */
+  onRun: (force?: boolean) => void;
   /** 跑的时候可以停 */
   onCancel?: () => void;
   /** 丢掉改动，回到最近一次执行出来的那张图 */
@@ -397,6 +413,8 @@ export function CanvasGraph({
   /** 生成过程中的节点状态：跑到哪个节点、跑到几成 */
   runNodes?: Record<string, NodeRun>;
   runNow?: string | null;
+  /** 节点产物：跑到哪一步、那一步出了什么，直接贴在节点上看 */
+  nodeArtifacts?: Record<string, NodeArtifact>;
 }) {
   /** 画布永远是编辑器：没有只读态，人和 AI 改的是同一张图 */
   const editing = true;
@@ -409,6 +427,8 @@ export function CanvasGraph({
   const [marquee, setMarquee] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(
     null
   );
+  /** 点节点缩略图后的大图预览：先看够再决定跑不跑下一步，不用切页面 */
+  const [preview, setPreview] = useState<{ node: string; art: NodeArtifact } | null>(null);
   const [menu, setMenu] = useState<Menu | null>(null);
   const [picker, setPicker] = useState<{ at: Pos; sx: number; sy: number } | null>(null);
   const [pickerQuery, setPickerQuery] = useState("");
@@ -438,9 +458,14 @@ export function CanvasGraph({
   const rowsOf = (id: string) => inputRows(graph, id, expanded);
   const foldOf = (id: string) => foldedRows(graph, id, expanded);
   const optOf = (id: string) => optionalKeys(graph, id);
-  const hOf = (id: string) => nodeHeight(graph, id, expanded);
+  const hasArt = (id: string) => !!nodeArtifacts?.[id];
+  const artCount = Object.keys(nodeArtifacts || {}).length;
+  const hOf = (id: string) => nodeHeight(graph, id, expanded, hasArt);
   const outAt = (id: string, p: Pos, j: number) => outAnchor(graph, id, p, j, expanded);
-  const layout = useMemo(() => computeLayout(graph, expanded), [graph, expanded]);
+  const layout = useMemo(
+    () => computeLayout(graph, expanded, (id) => !!nodeArtifacts?.[id]),
+    [graph, expanded, nodeArtifacts]
+  );
   /** 展开/收起可选输入：纯视图状态，不动图，也不进撤销；随工程持久化，刷新后还是你摊开的那几个 */
   const toggleExpand = (id: string) => {
     const n = new Set(expanded);
@@ -1100,12 +1125,19 @@ export function CanvasGraph({
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
 
       if (e.key === "Escape") {
+        // 大图预览优先关：开着预览按 Esc，不该顺手把选中的节点也取消掉
+        if (preview) {
+          setPreview(null);
+          return;
+        }
         setMenu(null);
         setPicker(null);
         setSelIds([]);
         setSelLink(null);
         return;
       }
+      // 开着大图预览时，只认 Esc：别把预览挡着还让 Delete 删了节点
+      if (preview) return;
       if ((e.key === "Delete" || e.key === "Backspace") && editing) {
         if (selLink) {
           // 生成中不动图：跑着的记录和画布必须对得上（工具栏按钮有 disabled，键盘也要同一道闸）
@@ -1134,11 +1166,11 @@ export function CanvasGraph({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [editing, selIds, selLink, graph, busy]);
+  }, [editing, selIds, selLink, graph, busy, preview]);
 
-  const run = () => {
+  const run = (force = false) => {
     if (busy) return;
-    onRun();
+    onRun(force);
   };
 
   const pickerResults = useMemo(() => {
@@ -1251,6 +1283,11 @@ export function CanvasGraph({
           </span>
         ) : doc.note ? (
           <span className="max-w-[300px] truncate t-11 text-[var(--fg-4)]">{doc.note}</span>
+        ) : artCount ? (
+          // 上次做到哪一步是看得见的：这几张图就贴在节点上，接着跑只补没做的
+          <span className="truncate t-11 text-[var(--fg-4)]">
+            已有 {artCount} 个产物 · 「开始生成」只补没做的
+          </span>
         ) : null}
 
         <div className="flex-1" />
@@ -1287,16 +1324,31 @@ export function CanvasGraph({
             停止
           </Btn>
         ) : (
-          <Btn
-            size="xs"
-            variant="accent"
-            onClick={run}
-            disabled={Object.keys(doc.graph).length === 0}
-            title={Object.keys(doc.graph).length === 0 ? "画布还是空的，先加节点再生成" : "按画布上这张图执行，这就是唯一的生成入口"}
-            icon={I.play(10)}
-          >
-            开始生成
-          </Btn>
+          <>
+            <Btn
+              size="xs"
+              variant="accent"
+              onClick={() => run()}
+              disabled={Object.keys(doc.graph).length === 0}
+              title={
+                Object.keys(doc.graph).length === 0
+                  ? "画布还是空的，先加节点再生成"
+                  : "按画布上这张图执行；上次已经做出来的节点直接复用，只补没做的那几步"
+              }
+              icon={I.play(10)}
+            >
+              开始生成
+            </Btn>
+            <Btn
+              size="xs"
+              variant="ghost"
+              onClick={() => run(true)}
+              disabled={Object.keys(doc.graph).length === 0}
+              title="不吃缓存，全部节点重新跑一遍（钱会重新花）"
+            >
+              重跑
+            </Btn>
+          </>
         )}
       </div>
 
@@ -1430,6 +1482,7 @@ export function CanvasGraph({
             const h = hOf(id);
             // 生成中的实时状态：跑到这个节点就亮起来，跑完打勾
             const run = runNodes?.[id];
+            const art = nodeArtifacts?.[id];
             const running = run?.s === "run";
             const runPct = Math.round((run?.pct ?? 0) * 100);
             // AI 铺图动画里还没轮到它
@@ -1671,6 +1724,43 @@ export function CanvasGraph({
                   </div>
                 ) : null}
 
+                {art ? (
+                  // 产物直接贴在节点上：跑到这一步就能看见出了什么，
+                  // 不用切到别的页面去猜"刚才那张图长啥样"
+                  <button
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setPreview({ node: id, art });
+                    }}
+                    title="点开看大图（改完再跑下一步）"
+                    className="absolute inset-x-1.5 bottom-1.5 overflow-hidden rounded-[6px] bg-[var(--bg-base)] shadow-[inset_0_0_0_0.5px_var(--line-2)] transition-shadow hover:shadow-[inset_0_0_0_0.5px_var(--accent-dim)]"
+                    style={{ height: THUMB_H - 12 }}
+                  >
+                    {art.kind === "video" ? (
+                      <video
+                        src={mediaSrc({ filename: art.filename, subfolder: art.subfolder, url: "" })}
+                        muted
+                        loop
+                        playsInline
+                        autoPlay
+                        className="size-full object-cover"
+                      />
+                    ) : (
+                      <img
+                        src={mediaSrc({ filename: art.filename, subfolder: art.subfolder, url: "" })}
+                        alt=""
+                        className="size-full object-cover"
+                      />
+                    )}
+                    {art.kind === "video" ? (
+                      <span className="pointer-events-none absolute bottom-1 right-1 rounded-[3px] bg-black/55 px-1 text-[10px] leading-[14px] text-white/90">
+                        视频
+                      </span>
+                    ) : null}
+                  </button>
+                ) : null}
+
                 {!rows.length && !outList.length ? (
                   <div className="px-2.5 pb-2 t-11 text-[var(--fg-4)]">{node.class_type}</div>
                 ) : null}
@@ -1693,6 +1783,55 @@ export function CanvasGraph({
               height: (marquee.y1 - marquee.y0) * view.k,
             }}
           />
+        ) : null}
+
+        {/* 产物大图：先在这看清楚脸和背景，再决定要不要烧视频的钱 */}
+        {preview ? (
+          <div
+            className="absolute inset-0 z-30 flex flex-col bg-[var(--bg-base)]/88 backdrop-blur-sm fade-in"
+            onPointerDown={(e) => {
+              e.stopPropagation();
+              setPreview(null);
+            }}
+          >
+            <div className="flex items-center gap-2 px-3 py-2">
+              <span className="t-12 text-[var(--fg-2)]">
+                {graph[preview.node]?._meta?.title || preview.node}
+              </span>
+              <span className="t-11 font-mono text-[var(--fg-4)]">
+                _run/{preview.art.filename}
+              </span>
+              <div className="flex-1" />
+              <span className="t-11 text-[var(--fg-4)]">点空白或按 Esc 关闭</span>
+            </div>
+            <div className="grid min-h-0 flex-1 place-items-center px-4 pb-4">
+              {preview.art.kind === "video" ? (
+                <video
+                  src={mediaSrc({
+                    filename: preview.art.filename,
+                    subfolder: preview.art.subfolder,
+                    url: "",
+                  })}
+                  controls
+                  autoPlay
+                  loop
+                  className="max-h-full max-w-full rounded-[10px] shadow-[0_24px_60px_-24px_rgba(0,0,0,0.9)]"
+                  onPointerDown={(e) => e.stopPropagation()}
+                />
+              ) : (
+                <img
+                  src={mediaSrc({
+                    filename: preview.art.filename,
+                    subfolder: preview.art.subfolder,
+                    url: "",
+                  })}
+                  alt=""
+                  className="max-h-full max-w-full rounded-[10px] shadow-[0_24px_60px_-24px_rgba(0,0,0,0.9)]"
+                  onPointerDown={(e) => e.stopPropagation()}
+                />
+              )}
+            </div>
+          </div>
         ) : null}
 
         {/* 左下操作提示：改动清单摊开时让位，别叠在一起 */}

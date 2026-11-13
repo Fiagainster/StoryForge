@@ -43,6 +43,9 @@ export interface EnvReport {
   ffmpegReady: boolean;
   llmKeySet: boolean;
   arkKeySet: boolean;
+  /** 百炼 Key 是否已配置（动作迁移依赖它） */
+  bailianKeySet?: boolean;
+  bailianBase?: string;
   llmModel: string;
   llmBaseUrl: string;
   /** 兼容保留：内核时代无端口概念，恒为 0 */
@@ -119,10 +122,41 @@ export interface DramaShot {
 
 export interface DramaPlan {
   title: string;
-  mode: "image" | "video";
+  /** motion = 动作迁移（参考视频驱动），与生成式的 image/video 是两条链路 */
+  mode: "image" | "video" | "motion";
   style: string;
   characters: DramaCharacter[];
   shots: DramaShot[];
+  /** 动作迁移参数：只有 mode=motion 时存在 */
+  motion?: MotionSetup;
+}
+
+/** 动作迁移（wan2.2-animate-move）的素材与档位 */
+export interface MotionSetup {
+  /** 参考动作视频文件名，需放在工作区 input/ 下 */
+  referenceVideo: string;
+  /** 人物参考图文件名（甲方给的那张脸），同样放 input/ 下，可留空 */
+  characterRef?: string;
+  /** 场景描述：先出空镜背景，再让定妆图把人放进去。空 = 不指定背景 */
+  scene?: string;
+  /** 定妆图尺寸，要与参考视频比例接近（横屏素材用 1920x1080） */
+  size?: string;
+  /**
+   * stills = 只出参考图（背景 + 定妆），不花钱跑视频；
+   * full = 出完整视频。默认 full。
+   */
+  stage?: "stills" | "full";
+  /**
+   * 已生成的人物图文件名（output/ 下）。填了就复用它，跳过重新定妆——
+   * 「先看图满意，再跑视频」靠这个不重复花钱。
+   */
+  characterImage?: string;
+  /** wan-pro=1080P/25fps（0.6 元/秒）；wan-std=720P/15fps（0.4 元/秒） */
+  animateMode: "wan-pro" | "wan-std";
+  /** 是否做人脸检测；白模等无五官素材可关掉 */
+  checkImage: boolean;
+  /** 参考视频真实时长（秒），用于成本估算；0=未知 */
+  referenceSeconds?: number;
 }
 
 /** 一镜的实耗拆解：等多久、跑多久、重了几次 */
@@ -193,6 +227,13 @@ export interface AppConfig {
   };
   /** P1-2 即梦凭据（火山 IAM Access Key） */
   jimeng?: { accessKey: string; secretKey: string };
+  /** 百炼（DashScope）：动作迁移专用，与 ARK 是两套 Key */
+  bailian?: {
+    apiKey: string;
+    /** 地域域名；留空走北京公共域名。填业务空间专属域名更稳 */
+    baseUrl?: string;
+    region?: "cn-beijing" | "ap-southeast-1";
+  };
   /** 单次生成的预算上限：超出会被截断 */
   budget: {
     maxShots: number;

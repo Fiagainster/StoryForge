@@ -19,6 +19,8 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const [videoProvider, setVideoProvider] = useState<"ark" | "jimeng">("ark");
   const [jimengAk, setJimengAk] = useState("");
   const [jimengSk, setJimengSk] = useState("");
+  const [bailianKey, setBailianKey] = useState("");
+  const [bailianBase, setBailianBase] = useState("");
   const [maxShots, setMaxShots] = useState("3");
   const [maxSeconds, setMaxSeconds] = useState("30");
   const [maxCny, setMaxCny] = useState("");
@@ -41,6 +43,8 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
     setVideoProvider(config.video?.provider ?? "ark");
     setJimengAk(config.jimeng?.accessKey || "");
     setJimengSk(config.jimeng?.secretKey || "");
+    setBailianKey(config.bailian?.apiKey || "");
+    setBailianBase(config.bailian?.baseUrl || "");
     setGenAudio(config.video?.generateAudio !== false);
     setMaxShots(String(config.budget?.maxShots ?? 3));
     setMaxSeconds(String(config.budget?.maxSeconds ?? 30));
@@ -56,6 +60,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
       image: { model: imageModel },
       video: { model: videoModel, resolution, generateAudio: genAudio, provider: videoProvider },
       jimeng: { accessKey: jimengAk, secretKey: jimengSk },
+      bailian: { apiKey: bailianKey, baseUrl: bailianBase, region: "cn-beijing" },
       budget: {
         maxShots: Math.max(1, Number(maxShots) || 3),
         maxSeconds: Math.max(4, Number(maxSeconds) || 30),
@@ -275,6 +280,43 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                 </p>
               </div>
             ) : null}
+          </Section>
+
+          <Section title="动作迁移 · 百炼" hint="把参考视频里的动作搬到人物图上">
+            <Field
+              label="百炼 API Key"
+              hint={env?.bailianKeySet ? "已配置" : "未配置 · 动作迁移不可用"}
+            >
+              <input
+                type="password"
+                value={bailianKey}
+                onChange={(e) => setBailianKey(e.target.value)}
+                placeholder="sk-...（百炼控制台创建）"
+                className="field font-mono"
+              />
+            </Field>
+            <Field label="地域域名" hint="留空 = 北京公共域名；Key 与地域必须一致">
+              <input
+                value={bailianBase}
+                onChange={(e) => setBailianBase(e.target.value)}
+                placeholder="https://dashscope.aliyuncs.com"
+                className="field font-mono"
+              />
+            </Field>
+            <p className="t-11 leading-[17px] text-[var(--fg-4)]">
+              wan2.2-animate-move：一张人物图 + 一段 2~30 秒参考视频，输出人物做同一套动作的视频。
+              北京地域 0.4 元/秒（720P/15fps·标准）与 0.6 元/秒（1080P/25fps·专业），只按成功输出秒数计费，输入不计费；
+              新账号有 50 秒免费额度。本地视频会先传百炼临时空间（48 小时有效），不落公网。
+            </p>
+            <Btn
+              size="sm"
+              onClick={async () => {
+                const dir = await api.comfyInputDir();
+                await api.openInExplorer(dir);
+              }}
+            >
+              打开素材目录（参考视频 / 人物参考图放这里）
+            </Btn>
           </Section>
 
           <Section title="预算" hint="超出自动截断">

@@ -32,6 +32,18 @@ export interface CleanupResult {
 /** 递归列出 output/ 下所有文件（跳过 _trash），筛测试产物用 */
 export const comfyOutputList = () => invoke<OutFile[]>("comfy_output_list");
 
+/** 工作区 input/ 目录：参考视频与人物参考图要放这里 */
+export const comfyInputDir = () => invoke<string>("comfy_input_dir");
+
+export interface InFile {
+  filename: string;
+  kind: "video" | "image";
+  bytes: number;
+}
+
+/** input/ 下的素材清单：动作迁移要靠它确定真实文件名 */
+export const comfyInputList = () => invoke<InFile[]>("comfy_input_list");
+
 /** 把指定文件移进 output/_trash/——不真删，可恢复 */
 export const comfyOutputTrash = (items: OutFile[]) =>
   invoke<CleanupResult>("comfy_output_trash", { items });

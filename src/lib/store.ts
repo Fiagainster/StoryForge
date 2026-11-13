@@ -16,6 +16,8 @@ import type {
 } from "../types";
 import * as api from "./api";
 import { mergeShotAssets, mergeShotCost, mergeShotGraph, remapShotAssets, remapShotGraph } from "./shot-merge";
+import { artifactFromEvent, artifactsFromRunFiles } from "./runArtifacts";
+import type { NodeArtifact } from "./runArtifacts";
 
 /** 和 media.ts 里的同名函数同一套规则：按 outDir 的分隔符风格拼绝对路径 */
 const joinPath = (dir: string, ...parts: (string | undefined)[]) => {
@@ -56,6 +58,8 @@ export interface NodeRun {
   /** 0–1，进度条用 */
   pct?: number;
 }
+
+export type { NodeArtifact } from "./runArtifacts";
 
 export interface CanvasDoc {
   id: string;
@@ -115,6 +119,16 @@ interface Store {
   runNodes: Record<string, NodeRun>;
   /** 当前正在跑的节点 id，工具栏显示用 */
   runNow: string | null;
+  /**
+   * 画布节点上的产物：节点 id → 磁盘上的文件。
+   * 跑完不清、重启还在（从 output/_run 扫出来），这样任何时候打开画布
+   * 都能看到"上次做到哪一步"，接着改、接着跑。
+   */
+  nodeArtifacts: Record<string, NodeArtifact>;
+  /** 扫一遍 output/_run，把已有产物挂回画布 */
+  hydrateArtifacts: () => Promise<void>;
+  /** 抹掉某个节点的产物（只从画布上摘掉，文件不动） */
+  dropArtifact: (id: string) => void;
   /** 用户点了停止：等所有 await 点自己收手 */
   cancelRequested: boolean;
   cancelRun: () => Promise<void>;
@@ -129,8 +143,8 @@ interface Store {
   send: (text: string) => Promise<void>;
   /** 人在画布上改图 */
   setDraftGraph: (g: ComfyGraph) => void;
-  /** 执行当前画布（唯一的生成入口） */
-  runDraft: () => Promise<void>;
+  /** 执行当前画布（唯一的生成入口）。force=true 时不吃缓存，全部重跑 */
+  runDraft: (force?: boolean) => Promise<void>;
   /** P1-3 双方案：A/B 两版互换（plan ↔ planAlt），换完重编译画布 */
   swapPlanVariant: () => void;
   /** 丢掉画布改动，回到最近一次执行的那张图 */
@@ -501,10 +515,16 @@ export const useStore = create<Store>((set, get) => {
         set({ runNodes: { ...cur, [e.node]: { s: "run", pct } } });
         return;
       }
-      case "nodeDone":
+      case "nodeDone": {
         if (!e.node) return;
-        set({ runNodes: { ...cur, [e.node]: { s: "done", pct: 1 } } });
+        const patch: Partial<Store> = {
+          runNodes: { ...cur, [e.node]: { s: "done", pct: 1 } },
+        };
+        const art = artifactFromEvent(e.file);
+        if (art) patch.nodeArtifacts = { ...get().nodeArtifacts, [e.node]: art };
+        set(patch);
         return;
+      }
       case "cached": {
         const next: Record<string, NodeRun> = { ...cur };
         for (const id of e.nodes || []) next[id] = { s: "cache" };
@@ -565,6 +585,7 @@ export const useStore = create<Store>((set, get) => {
   starting: false,
   runNodes: {},
   runNow: null,
+  nodeArtifacts: {},
   messages: initialSession.messages,
   runs: [],
   logs: [],
@@ -663,6 +684,8 @@ export const useStore = create<Store>((set, get) => {
         .comfyOutputDir()
         .then((dir) => set({ outDir: dir }))
         .catch(() => set({ outDir: null }));
+      // 上次做到哪一步：把 _run 里已有的节点产物挂回画布（重启也不丢）
+      void get().hydrateArtifacts();
       get().addLog(
         "info",
         `根目录：${env.projectRoot}｜工作区：${env.comfyBaseExists ? "已就绪" : "缺失"}｜提示词：${
@@ -674,6 +697,22 @@ export const useStore = create<Store>((set, get) => {
       get().addLog("error", `初始化失败：${e}`);
     }
   },
+
+  hydrateArtifacts: async () => {
+    try {
+      const list = await api.comfyOutputList();
+      set({ nodeArtifacts: artifactsFromRunFiles(list, get().nodeArtifacts) });
+    } catch {
+      /* 拿不到就当没有，画布上不显示产物不影响别的 */
+    }
+  },
+
+  dropArtifact: (id) =>
+    set((s) => {
+      const next = { ...s.nodeArtifacts };
+      delete next[id];
+      return { nodeArtifacts: next };
+    }),
 
   refreshComfy: async () => {
     try {
@@ -753,6 +792,27 @@ export const useStore = create<Store>((set, get) => {
     try {
       const { config, comfy, draft } = get();
       const c = client(config, comfy);
+      // 素材清单每轮现取：用户可能刚往 input/ 里拖了视频，别拿旧缓存
+      let inputFiles: { filename: string; kind: string }[] = [];
+      try {
+        inputFiles = await api.comfyInputList();
+      } catch {
+        inputFiles = [];
+      }
+      // 最近产出的图：第二轮「用刚才那张跑视频」要靠真实文件名复用，不能靠模型记
+      let recentImages: { filename: string }[] = [];
+      try {
+        const outs = await api.comfyOutputList();
+        recentImages = outs
+          // _run 里是画布用的节点现场副本，和正式产物重复，别喂给模型占篇幅
+          .filter((f) => f.subfolder !== "_run")
+          .filter((f) => /\.(png|jpe?g|webp)$/i.test(f.filename))
+          .sort((a, b) => (a.filename < b.filename ? 1 : -1))
+          .slice(0, 8)
+          .map((f) => ({ filename: f.filename }));
+      } catch {
+        recentImages = [];
+      }
       const result = await runAgentTurn(
         trimmed,
         c,
@@ -777,6 +837,9 @@ export const useStore = create<Store>((set, get) => {
           confirmBeforeRun: true,
           budget: config?.budget,
           lessons: config?.memory?.learnings ?? [],
+          hasBailianKey: !!config?.bailian?.apiKey,
+          inputFiles,
+          recentImages,
         }
       );
 
@@ -1078,7 +1141,7 @@ export const useStore = create<Store>((set, get) => {
     get().addLog("info", `已切到「${next.title}」，画布重编译完成；再点一次可换回「${prev.title}」。`);
   },
 
-  runDraft: async () => {
+  runDraft: async (force = false) => {
     const doc = get().draft;
     if (get().busy) return;
 
@@ -1162,6 +1225,8 @@ export const useStore = create<Store>((set, get) => {
         repairOnFailure: !!config?.llm?.apiKey,
         hasModelKey: !!config?.llm?.apiKey,
         lessons: config?.memory?.learnings ?? [],
+        // 默认吃缓存：上次已经做出来的节点直接复用，只补没做的那几步
+        forceNodes: force ? "*" : undefined,
       });
 
       endTurn(turnId, {
@@ -1500,6 +1565,8 @@ export const useStore = create<Store>((set, get) => {
           repairOnFailure: true,
           lessons: config?.memory?.learnings ?? [],
           onLesson: (lesson) => void get().addLearning(lesson),
+          // 人点「重跑这一镜」就是要新结果，不能因为输入没变就把旧片还给他
+          forceNodes: "*",
         }
       );
 
@@ -1923,6 +1990,8 @@ export const useStore = create<Store>((set, get) => {
           .flatMap((r) => r.assets.map((a) => `${(a.subfolder || "").replace(/\\/g, "/")}/${a.filename ?? ""}`))
       );
       const cands = files.filter((f) => {
+        // _run 是画布上"做到哪一步"的现场，删了画布就空了，永远不进清理候选
+        if ((f.subfolder || "") === "_run") return false;
         const path = `${(f.subfolder || "").replace(/\\/g, "/")}/${f.filename}`;
         if (path.startsWith("_trash/") || path.startsWith("storyforge/film/")) return false;
         const stem = f.filename.replace(/\.[^.]+$/, "");

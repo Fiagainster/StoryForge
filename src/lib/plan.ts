@@ -4,6 +4,7 @@ import type {
   DramaCharacter,
   DramaPlan,
   DramaShot,
+  MotionSetup,
   ShotSize,
 } from "../types";
 
@@ -43,6 +44,9 @@ export interface ParsedPlan {
 const text = (v: unknown, max = 400): string =>
   typeof v === "string" ? v.trim().slice(0, max) : "";
 
+/** 只留文件名：用户/模型常把完整路径写进来，内核只认工作区 input/ 下的相对名 */
+const basename = (p: string) => p.replace(/\\/g, "/").split("/").filter(Boolean).pop() || "";
+
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n));
 
 /**
@@ -56,9 +60,34 @@ export function parsePlan(raw: unknown): ParsedPlan {
   }
   const obj = raw as Record<string, unknown>;
 
-  const mode: DramaPlan["mode"] = obj.mode === "image" ? "image" : "video";
+  const mode: DramaPlan["mode"] =
+    obj.mode === "motion" ? "motion" : obj.mode === "image" ? "image" : "video";
   const title = text(obj.title, 40) || "未命名短剧";
   const style = text(obj.style, 500);
+
+  // 动作迁移：素材是「一段参考视频 + 一张人物图」，不走分镜生成那条路
+  let motion: MotionSetup | undefined;
+  if (mode === "motion") {
+    const m = (obj.motion || {}) as Record<string, unknown>;
+    // 只出参考图时不需要参考视频：这一步根本不碰视频
+    const stage: "stills" | "full" = m.stage === "stills" ? "stills" : "full";
+    const referenceVideo = text(m.referenceVideo, 200);
+    if (!referenceVideo && stage !== "stills") {
+      throw new Error("动作迁移缺少参考视频文件名（motion.referenceVideo，文件需放在工作区 input/ 下）");
+    }
+    const secs = Number(m.referenceSeconds);
+    motion = {
+      referenceVideo: basename(referenceVideo),
+      characterRef: basename(text(m.characterRef, 200)) || undefined,
+      scene: text(m.scene, 500) || undefined,
+      size: text(m.size, 20) || undefined,
+      stage,
+      characterImage: basename(text(m.characterImage, 200)) || undefined,
+      animateMode: m.animateMode === "wan-std" ? "wan-std" : "wan-pro",
+      checkImage: m.checkImage !== false,
+      referenceSeconds: Number.isFinite(secs) ? clamp(Math.round(secs), 2, 30) : 0,
+    };
+  }
 
   const rawChars = Array.isArray(obj.characters) ? obj.characters.slice(0, MAX_CHARACTERS) : [];
   const characters: DramaCharacter[] = [];
@@ -80,7 +109,11 @@ export function parsePlan(raw: unknown): ParsedPlan {
   });
 
   const rawShots = Array.isArray(obj.shots) ? obj.shots.slice(0, MAX_SHOTS) : [];
-  if (!rawShots.length) throw new Error("计划里没有镜头");
+  if (!rawShots.length) {
+    // 动作迁移只需要一镜（整段参考视频），没给就补一条占位，让分镜板有卡可看
+    if (mode !== "motion") throw new Error("计划里没有镜头");
+    rawShots.push({ title: "动作迁移", action: "把参考视频里的动作迁移到人物身上" });
+  }
 
   const shots: DramaShot[] = rawShots.map((item, index) => {
     const s = (item || {}) as Record<string, unknown>;
@@ -94,16 +127,24 @@ export function parsePlan(raw: unknown): ParsedPlan {
     const shotSize = SHOT_SIZES.includes(s.shotSize as ShotSize)
       ? (s.shotSize as ShotSize)
       : "中景";
-    if (shotSize !== s.shotSize) warnings.push(`镜头 ${index + 1} 景别不合法，回退到中景`);
+    // 动作迁移的景别/运镜由参考视频决定，这两个字段没有意义，不要拿它报警告
+    if (mode !== "motion" && shotSize !== s.shotSize) {
+      warnings.push(`镜头 ${index + 1} 景别不合法，回退到中景`);
+    }
     const camera = CAMERA_MOVES.includes(s.camera as CameraMove)
       ? (s.camera as CameraMove)
       : "固定";
-    if (camera !== s.camera) warnings.push(`镜头 ${index + 1} 运镜不合法，回退到固定`);
+    if (mode !== "motion" && camera !== s.camera) {
+      warnings.push(`镜头 ${index + 1} 运镜不合法，回退到固定`);
+    }
 
     const rawDuration = Number(s.duration);
-    const duration = Number.isFinite(rawDuration)
-      ? clamp(Math.round(rawDuration), 4, MAX_SHOT_SECONDS)
-      : 5;
+    const duration =
+      mode === "motion"
+        ? clamp(motion?.referenceSeconds || 20, 2, 30)
+        : Number.isFinite(rawDuration)
+          ? clamp(Math.round(rawDuration), 4, MAX_SHOT_SECONDS)
+          : 5;
 
     // 有台词的镜头必须配音：generateAudio=false 会把台词无声丢掉
     const dialogue = text(s.dialogue, 120);
@@ -127,7 +168,7 @@ export function parsePlan(raw: unknown): ParsedPlan {
   });
 
   return {
-    plan: { title, mode, style, characters, shots },
+    plan: { title, mode, style, characters, shots, motion },
     warnings,
   };
 }
@@ -167,7 +208,138 @@ export function maxShotOf(graph: ComfyGraph): number {
 /**
  * 计划 → ComfyUI API 图。连线由编译器保证，不交给模型即兴发挥。
  */
+/**
+ * 动作迁移图：参考视频 + 人物参考图（+ 空镜背景） → 定妆 → wan2.2-animate-move → 落盘。
+ *
+ * 两条来自模型行为的硬约束，决定了这张图的形状：
+ *   1. **move 保留的是人物图的背景**（不是参考视频的背景）。所以背景要先生成一张空镜，
+ *      再让定妆图把人物放进这个场景——成片背景就是这张图，不需要任何抠像合成。
+ *   2. 人物图必须与参考视频同比例、同景别占位，否则动作迁移会把人拉变形。
+ *
+ * 两个开关让「先看图、再跑视频」成立：
+ *   stage=stills 只编译出图部分（背景 + 定妆），一个视频请求都不发；
+ *   stage=full 且带 characterImage 时直接复用上一轮出的定妆图，不重新生成、不重复花钱。
+ */
+export function compileMotionPlan(plan: DramaPlan, opts: CompileOptions): ComfyGraph {
+  const setup = plan.motion;
+  if (!setup) throw new Error("动作迁移计划缺少 motion 配置");
+  const graph: ComfyGraph = {};
+  const size = setup.size || opts.imageSize;
+  const stillsOnly = setup.stage === "stills";
+  const reuse = (setup.characterImage || "").trim();
+
+  // ---- 人物图：能复用就复用，复用不了才现生成 ----
+  let charNode = "";
+  let charUrlSlot: number | null = null;
+  if (reuse) {
+    graph["motion_char_reuse"] = {
+      class_type: "LoadImage",
+      inputs: { image: reuse },
+      _meta: { title: `复用定妆 · ${reuse}` },
+    };
+    charNode = "motion_char_reuse";
+  } else {
+    const cast = plan.characters[0];
+    const charInputs: Record<string, unknown> = {
+      name: cast?.name || "主角",
+      anchor: cast?.anchor || "古风汉服造型，广袖长裙，发髻与流苏发簪",
+      style: plan.style,
+      model: opts.imageModel,
+      // 全身是硬要求：画幅占比要和参考视频里的人物接近，否则迁移会变形
+      framing: "全身",
+      size,
+      watermark: false,
+    };
+    if (setup.characterRef) {
+      graph["motion_face"] = {
+        class_type: "LoadImage",
+        inputs: { image: setup.characterRef },
+        _meta: { title: `人物参考 · ${setup.characterRef}` },
+      };
+      charInputs.reference_image = ["motion_face", 0];
+    }
+    // 空镜背景：先定场景，再让定妆把人物放进去。背景图单独落盘，多镜头复用同一张
+    const scene = (setup.scene || "").trim();
+    if (scene) {
+      graph["motion_bg"] = {
+        class_type: "DramaBackdrop",
+        inputs: {
+          scene,
+          style: plan.style,
+          model: opts.imageModel,
+          size,
+          watermark: false,
+        },
+        _meta: { title: "空镜背景" },
+      };
+      graph["motion_bg_save"] = {
+        class_type: "SaveImage",
+        inputs: { images: ["motion_bg", 0], filename_prefix: "storyforge/motion_bg" },
+        _meta: { title: "保存背景" },
+      };
+      charInputs.backdrop = ["motion_bg", 0];
+    }
+    graph["motion_char"] = {
+      class_type: "DramaCharacter",
+      inputs: charInputs,
+      _meta: { title: `定妆 · ${cast?.name || "主角"}` },
+    };
+    graph["motion_char_save"] = {
+      class_type: "SaveImage",
+      inputs: { images: ["motion_char", 0], filename_prefix: "storyforge/motion_char" },
+      _meta: { title: "保存定妆" },
+    };
+    charNode = "motion_char";
+    charUrlSlot = 1;
+  }
+
+  // 只出图：到此为止。没有 WanAnimate 节点，就算误点生成也不会扣视频钱
+  if (stillsOnly) return graph;
+
+  // ---- 视频链路：参考视频先规整（模型只吃 2~30 秒、边长 ≤2048、≤200MB）----
+  graph["motion_ref"] = {
+    class_type: "LoadVideo",
+    inputs: { video: setup.referenceVideo },
+    _meta: { title: `参考视频 · ${setup.referenceVideo}` },
+  };
+  graph["motion_fit"] = {
+    class_type: "VideoFit",
+    inputs: { video: ["motion_ref", 0], max_seconds: 30, max_width: 1080 },
+    _meta: { title: "视频规整" },
+  };
+  const wanInputs: Record<string, unknown> = {
+    character: [charNode, 0],
+    video: ["motion_fit", 0],
+    mode: setup.animateMode,
+    check_image: setup.checkImage,
+    watermark: false,
+    duration: setup.referenceSeconds || 0,
+  };
+  // 定妆节点的第 2 输出是原始 URL，命中时内核省一次上传；复用图没有 URL，就不接
+  if (charUrlSlot !== null) {
+    wanInputs.character_url = [charNode, charUrlSlot];
+  }
+  graph["shot_1_video"] = {
+    class_type: "WanAnimate",
+    inputs: wanInputs,
+    _meta: { title: "动作迁移" },
+  };
+  graph["shot_1_save"] = {
+    class_type: "SaveVideo",
+    inputs: {
+      video: ["shot_1_video", 0],
+      filename_prefix: "storyforge/motion",
+      format: "mp4",
+    },
+    _meta: { title: "保存成片" },
+  };
+  return graph;
+}
+
 export function compilePlan(plan: DramaPlan, opts: CompileOptions): ComfyGraph {
+  // 动作迁移是另一条链路：动作由参考视频决定，不经过「首帧 → 图生视频」
+  if (plan.mode === "motion") return compileMotionPlan(plan, opts);
+
   const graph: ComfyGraph = {};
   const used = new Set(plan.shots.flatMap((s) => s.characters));
   const charNodes = new Map<string, string>();

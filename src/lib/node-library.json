@@ -1,7 +1,7 @@
 {
   "version": "kernel-1.0",
   "generatedAt": "2026-10-30",
-  "stats": { "total": 12, "usable": 12, "needWeights": 0, "partner": 0 },
+  "stats": { "total": 15, "usable": 15, "needWeights": 0, "partner": 0 },
   "nodes": [
     {
       "n": "DramaCharacter",
@@ -14,6 +14,23 @@
         { "k": "style", "t": "STRING", "req": 1, "def": "" },
         { "k": "model", "t": "STRING", "req": 1, "def": "doubao-seedream-5-0-pro-260628" },
         { "k": "framing", "t": "COMBO", "req": 1, "opts": ["半身", "全身", "面部特写"], "def": "半身" },
+        { "k": "size", "t": "STRING", "req": 1, "def": "1080x1920" },
+        { "k": "watermark", "t": "BOOLEAN", "req": 1, "def": false },
+        { "k": "reference_image", "t": "IMAGE", "req": 0, "tip": "人物参考图：以这张脸为准，anchor 只写造型/服装" },
+        { "k": "backdrop", "t": "IMAGE", "req": 0, "tip": "场景参考图（接「空镜背景」）：人物会被放进这个场景里" }
+      ],
+      "out": ["IMAGE", "STRING"],
+      "api": 1
+    },
+    {
+      "n": "DramaBackdrop",
+      "d": "短剧 · 空镜背景",
+      "c": "StoryForge/短剧",
+      "desc": "生成一张无人的场景背景图。动作迁移保留的是人物图背景，所以场景在这里定死，定妆图再把人放进去",
+      "in": [
+        { "k": "scene", "t": "STRING", "req": 1, "def": "", "tip": "场景描述：地点、天气、时间、氛围、材质" },
+        { "k": "style", "t": "STRING", "req": 1, "def": "" },
+        { "k": "model", "t": "STRING", "req": 1, "def": "doubao-seedream-5-0-pro-260628" },
         { "k": "size", "t": "STRING", "req": 1, "def": "1080x1920" },
         { "k": "watermark", "t": "BOOLEAN", "req": 1, "def": false }
       ],
@@ -120,6 +137,35 @@
       ],
       "out": ["VIDEO"],
       "api": 1
+    },
+    {
+      "n": "WanAnimate",
+      "d": "短剧 · 动作迁移",
+      "c": "StoryForge/短剧",
+      "desc": "把参考视频里的动作与表情迁移到人物图上（百炼 wan2.2-animate-move），用于舞蹈复刻 / 表演复刻",
+      "in": [
+        { "k": "character", "t": "IMAGE", "req": 1, "tip": "人物图：全身、正面、面部清晰，画幅占比与参考视频接近" },
+        { "k": "video", "t": "VIDEO", "req": 1, "tip": "参考动作视频：2~30 秒，边长 ≤2048，≤200MB" },
+        { "k": "mode", "t": "COMBO", "req": 1, "opts": ["wan-pro", "wan-std"], "def": "wan-pro" },
+        { "k": "check_image", "t": "BOOLEAN", "req": 1, "def": true, "tip": "关掉可跳过人物检测——白模 / 无五官素材先试这个" },
+        { "k": "watermark", "t": "BOOLEAN", "req": 1, "def": false },
+        { "k": "duration", "t": "INT", "req": 0, "def": 0, "min": 0, "max": 30, "tip": "只用于成本估算；0 = 跟随参考视频真实时长" },
+        { "k": "character_url", "t": "STRING", "req": 0, "def": "", "tip": "接「角色定妆」的第 2 输出（原始 URL，省一次上传）" }
+      ],
+      "out": ["VIDEO"],
+      "api": 1
+    },
+    {
+      "n": "VideoFit",
+      "d": "视频规整",
+      "c": "video",
+      "desc": "裁时长、压尺寸，把素材修到模型能吃的范围（2~30 秒 / 边长 ≤2048 / ≤200MB），免费本地处理",
+      "in": [
+        { "k": "video", "t": "VIDEO", "req": 1 },
+        { "k": "max_seconds", "t": "INT", "req": 1, "def": 30, "min": 2, "max": 30 },
+        { "k": "max_width", "t": "INT", "req": 1, "def": 1080, "min": 200, "max": 2048 }
+      ],
+      "out": ["VIDEO"]
     },
     {
       "n": "SaveImage",

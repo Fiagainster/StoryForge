@@ -68,11 +68,15 @@ export const BLOCKED_INDEX = new Map<string, { why: string[] }>(
 const CORE = [
   // 生成（直连火山 ARK）
   "DramaCharacter",
+  "DramaBackdrop",
   "DramaShotFrame",
   "DramaShotVideo",
   "DramaContinuity",
   "StoryForgeSeedream",
   "StoryForgeSeedance",
+  // 动作迁移（百炼 wan2.2-animate-move）+ 素材规整
+  "WanAnimate",
+  "VideoFit",
   // 输入输出
   "EmptyImage",
   "ImageScale",

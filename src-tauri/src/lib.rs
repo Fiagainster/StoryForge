@@ -59,6 +59,11 @@ fn default_config() -> Value {
             "resolution": "720p",
             "generateAudio": true
         },
+        "bailian": {
+            "apiKey": "",
+            "baseUrl": "https://dashscope.aliyuncs.com",
+            "region": "cn-beijing"
+        },
         "budget": {
             "maxShots": 3,
             "maxSeconds": 30
@@ -275,6 +280,8 @@ fn env_check(app: tauri::AppHandle) -> Value {
         "torchInstalled": false,
         "llmKeySet": cfg["llm"]["apiKey"].as_str().map(|s| !s.trim().is_empty()).unwrap_or(false),
         "arkKeySet": cfg["ark"]["apiKey"].as_str().map(|s| !s.trim().is_empty()).unwrap_or(false),
+        "bailianKeySet": cfg["bailian"]["apiKey"].as_str().map(|s| !s.trim().is_empty()).unwrap_or(false),
+        "bailianBase": cfg["bailian"]["baseUrl"],
         "llmModel": cfg["llm"]["model"],
         "llmBaseUrl": cfg["llm"]["baseUrl"],
         "comfyPort": cfg["comfyPort"]
@@ -318,6 +325,62 @@ struct OutFile {
     filename: String,
     subfolder: String,
     bytes: u64,
+}
+
+/// 工作区 input/ 里的素材（动作迁移要用：模型必须知道真实文件名，不能瞎猜）
+#[derive(serde::Serialize)]
+struct InFile {
+    filename: String,
+    kind: String,
+    bytes: u64,
+}
+
+#[tauri::command]
+fn comfy_input_dir(app: tauri::AppHandle) -> Result<String, String> {
+    let cfg = load_config(&app);
+    let root = detect_root(&cfg);
+    let dir = resolve(&cfg, &root, "comfyBase").join("input");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.to_string_lossy().to_string())
+}
+
+/// 列出 input/ 下的图片与视频。参考视频 / 人脸参考图都要先放进这里。
+#[tauri::command]
+fn comfy_input_list(app: tauri::AppHandle) -> Result<Vec<InFile>, String> {
+    let cfg = load_config(&app);
+    let root = detect_root(&cfg);
+    let dir = resolve(&cfg, &root, "comfyBase").join("input");
+    if !dir.is_dir() {
+        return Ok(vec![]);
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())?.flatten() {
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        let ext = p
+            .extension()
+            .and_then(|x| x.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let kind = match ext.as_str() {
+            "mp4" | "mov" | "avi" | "mkv" | "webm" => "video",
+            "png" | "jpg" | "jpeg" | "webp" | "bmp" => "image",
+            _ => continue,
+        };
+        out.push(InFile {
+            filename: p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
+            kind: kind.to_string(),
+            bytes: entry.metadata().map(|m| m.len()).unwrap_or(0),
+        });
+    }
+    out.sort_by(|a, b| a.filename.cmp(&b.filename));
+    Ok(out)
 }
 
 #[derive(serde::Serialize)]
@@ -1040,6 +1103,8 @@ fn kernel_submit_cmd(
     app: tauri::AppHandle,
     graph: Value,
     client_id: String,
+    // 强制重跑的节点 id（逗号分隔，`*` = 整图）；不传则吃缓存
+    force_nodes: Option<String>,
 ) -> Result<Value, String> {
     let cfg = load_config(&app);
     let root = detect_root(&cfg);
@@ -1083,7 +1148,19 @@ fn kernel_submit_cmd(
     let jimeng_ak = cfg["jimeng"]["accessKey"].as_str().unwrap_or("").to_string();
     let jimeng_sk = cfg["jimeng"]["secretKey"].as_str().unwrap_or("").to_string();
 
-    kernel::kernel_submit(app, graph, client_id, out_dir.to_string_lossy().to_string(), prompts_dir.to_string_lossy().to_string(), ark_key, ffmpeg.to_string_lossy().to_string(), ffprobe.to_string_lossy().to_string(), budget_limit, budget_mode, video_provider, jimeng_ak, jimeng_sk)
+    // 百炼（DashScope）：动作迁移专用，与 ARK 两套 Key。地域域名可填业务空间专属域名，
+    // 留空走北京公共域名（与 Key 地域必须一致，否则鉴权失败）。
+    let bailian_key = cfg["bailian"]["apiKey"].as_str().unwrap_or("").trim().to_string();
+    let bailian_base = {
+        let b = cfg["bailian"]["baseUrl"].as_str().unwrap_or("").trim().to_string();
+        if b.is_empty() {
+            kernel::DASHSCOPE_CN_BASE.to_string()
+        } else {
+            b.trim_end_matches('/').to_string()
+        }
+    };
+
+    kernel::kernel_submit(app, graph, client_id, out_dir.to_string_lossy().to_string(), prompts_dir.to_string_lossy().to_string(), ark_key, ffmpeg.to_string_lossy().to_string(), ffprobe.to_string_lossy().to_string(), budget_limit, budget_mode, video_provider, jimeng_ak, jimeng_sk, bailian_key, bailian_base, force_nodes)
 }
 
 /// P2 多平台导出：把产物目录里的视频裁成另一比例（16:9 横版 / 9:16 竖版）。
@@ -1190,6 +1267,8 @@ pub fn run() {
             comfy_stop,
             comfy_output_dir,
             comfy_output_list,
+            comfy_input_dir,
+            comfy_input_list,
             comfy_output_trash,
             kernel_submit_cmd,
             estimate_cost_cmd,

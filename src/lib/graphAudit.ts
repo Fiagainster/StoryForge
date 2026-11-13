@@ -267,6 +267,8 @@ export function hasGenerator(graph: ComfyGraph): boolean {
   return Object.values(graph || {}).some((n) => {
     const ct = String(n?.class_type || "");
     if (ct.startsWith("Drama")) return true;
+    // 动作迁移走的是百炼，节点上没有 model 字段，但它确实是云端生成节点
+    if (ct === "WanAnimate" || ct === "StoryForgeSeedance") return true;
     return "model" in (n?.inputs || {});
   });
 }
