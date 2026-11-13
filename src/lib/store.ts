@@ -125,8 +125,8 @@ interface Store {
    * 都能看到"上次做到哪一步"，接着改、接着跑。
    */
   nodeArtifacts: Record<string, NodeArtifact>;
-  /** 扫一遍 output/_run，把已有产物挂回画布 */
-  hydrateArtifacts: () => Promise<void>;
+  /** 扫一遍 output/_run，把已有产物挂回画布；reset=true 时先清空（换了产物目录用） */
+  hydrateArtifacts: (reset?: boolean) => Promise<void>;
   /** 抹掉某个节点的产物（只从画布上摘掉，文件不动） */
   dropArtifact: (id: string) => void;
   /** 用户点了停止：等所有 await 点自己收手 */
@@ -698,10 +698,11 @@ export const useStore = create<Store>((set, get) => {
     }
   },
 
-  hydrateArtifacts: async () => {
+  hydrateArtifacts: async (reset = false) => {
     try {
       const list = await api.comfyOutputList();
-      set({ nodeArtifacts: artifactsFromRunFiles(list, get().nodeArtifacts) });
+      const base = reset ? {} : get().nodeArtifacts;
+      set({ nodeArtifacts: artifactsFromRunFiles(list, base) });
     } catch {
       /* 拿不到就当没有，画布上不显示产物不影响别的 */
     }
@@ -1665,6 +1666,13 @@ export const useStore = create<Store>((set, get) => {
       const config = await api.setConfig(patch);
       const env = await api.envCheck();
       set({ config, env });
+      // 换了产物目录：outDir 变了，缩略图和新产物的读取路径都得跟着换，
+      // 旧目录里那份画布现场也不再适用，重新扫一遍
+      if (!!patch && "outputDir" in (patch as Record<string, unknown>)) {
+        const dir = await api.comfyOutputDir().catch(() => null);
+        set({ outDir: dir });
+        await get().hydrateArtifacts(true);
+      }
       get().addLog("info", "配置已保存");
       const arkChanged =
         !!patch.ark && !!old && old.ark?.apiKey !== config.ark?.apiKey;

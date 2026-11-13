@@ -25,14 +25,16 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const [maxSeconds, setMaxSeconds] = useState("30");
   const [maxCny, setMaxCny] = useState("");
   const [costMode, setCostMode] = useState<"observe" | "warn" | "cap">("observe");
-  const [root, setRoot] = useState("");
+  const [outDir, setOutDir] = useState("");
+  const [moving, setMoving] = useState(false);
+  const [moveNote, setMoveNote] = useState("");
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [test, setTest] = useState<{ ok: boolean; msg: string } | null>(null);
 
   useEffect(() => {
     if (!config) return;
-    setRoot(config.productRoot || "");
+    setOutDir(config.outputDir || "");
     setBaseUrl(config.llm?.baseUrl || "");
     setApiKey(config.llm?.apiKey || "");
     setModel(config.llm?.model || "");
@@ -54,7 +56,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
 
   const buildPatch = () =>
     ({
-      productRoot: root.trim(),
+      outputDir: outDir.trim(),
       llm: { baseUrl, apiKey, model },
       ark: { apiKey: arkKey },
       image: { model: imageModel },
@@ -74,6 +76,27 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
     await saveConfig(buildPatch());
     setSaving(false);
     onClose();
+  };
+
+  /** 换产物目录：先搬（不覆盖同名文件），再落盘新路径，顺序反了旧路径就找不到了 */
+  const moveOutput = async () => {
+    const from = env?.outputDir || "";
+    const to = outDir.trim();
+    if (!to) return;
+    setMoving(true);
+    setMoveNote("");
+    try {
+      const r = await api.outputMigrate(from, to);
+      const mb = (r.bytes / 1048576).toFixed(1);
+      setMoveNote(
+        `搬了 ${r.moved} 个文件（${mb} MB）${r.skipped ? `，跳过 ${r.skipped} 个同名文件` : ""}`
+      );
+      await saveConfig({ outputDir: to });
+    } catch (e) {
+      setMoveNote(humanError(String(e)));
+    } finally {
+      setMoving(false);
+    }
   };
 
   // 测试连接走的是落盘后的配置，所以先存再打一次最小请求
@@ -365,45 +388,91 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
             </p>
           </Section>
 
-          <Section title="执行内核" hint="常驻，无需启动">
+          <Section title="存储位置" hint="产物放哪你说了算">
             <div className="grid grid-cols-[120px_1fr] gap-3">
-              <Field label="程序目录" hint="留空 = 自动，一般不用填">
+              <Field label="产物目录" hint="留空 = 安装目录下的 output">
                 <input
-                  value={root}
-                  onChange={(e) => setRoot(e.target.value)}
-                  placeholder={env?.productRoot || env?.projectRoot || "自动（安装版用 AppData）"}
+                  value={outDir}
+                  onChange={(e) => setOutDir(e.target.value)}
+                  placeholder={env?.outputDir || "安装目录\\output"}
                   className="field font-mono"
                 />
               </Field>
             </div>
-            <p className="t-11 leading-[17px] text-[var(--fg-4)]">
-              生成算力在云端 ARK；本地内核只做图的派发、收文件和像素杂活（占位图 / 缩放 / 抽帧 / 拼接），
-              不占显存、没有启动等待。安装版把运行时数据放在自己的 AppData 目录里，
-              不读也不写你装程序的文件夹；只有填了「程序目录」且那里确实有 engine/ 时才会改用指定位置。
-            </p>
-            <div className="space-y-1 rounded-[10px] bg-[var(--bg-2)] p-3 t-11 font-mono leading-[17px] text-[var(--fg-4)]">
-              <Path label="配置" value={env?.configPath} />
-              <Path
-                label="程序目录"
-                value={`${env?.productRoot || env?.projectRoot || ""}${
-                  env?.productRootAuto ? "（自动）" : ""
-                }`}
-              />
-              <Path label="工作区" value={env?.comfyBase} />
-              <Path label="提示词" value={env?.promptsDir || `${env?.projectRoot || ""}\\engine\\prompts`} />
-              <div className="flex gap-2">
-                <span className="w-12 shrink-0 text-[var(--fg-3)]">ffmpeg</span>
-                <span className={env?.ffmpegReady ? "text-[var(--ok)]" : "text-[var(--err)]"}>
-                  {env?.ffmpegReady ? "已就绪" : "缺失（拼接/抽帧不可用）"}
+            <div className="flex flex-wrap items-center gap-2">
+              <Btn
+                size="xs"
+                variant="outline"
+                onClick={() => void api.openInExplorer(env?.outputDir || "")}
+                disabled={!env?.outputDir}
+                title="在资源管理器里打开产物目录"
+              >
+                打开产物目录
+              </Btn>
+              <Btn
+                size="xs"
+                variant="ghost"
+                onClick={() => setOutDir("")}
+                title="清空后保存 = 回到安装目录下的 output"
+              >
+                恢复默认
+              </Btn>
+              {moving ? (
+                <span className="flex items-center gap-1 t-11 text-[var(--accent)]">
+                  <Spinner className="size-2.5" /> 正在搬…
                 </span>
-              </div>
-              <div className="flex gap-2">
-                <span className="w-12 shrink-0 text-[var(--fg-3)]">节点</span>
-                <span className={env?.nodesInstalled ? "text-[var(--ok)]" : "text-[var(--err)]"}>
-                  {env?.nodesInstalled ? "已就绪（模板内置，目录里那份可改）" : "缺失"}
-                </span>
-              </div>
+              ) : outDir.trim() && outDir.trim() !== (env?.outputDir || "") ? (
+                <Btn
+                  size="xs"
+                  variant="ghost"
+                  onClick={() => void moveOutput()}
+                  title="把当前产物目录里的东西整个搬到新目录（不覆盖已有文件）"
+                >
+                  把现有产物搬过去
+                </Btn>
+              ) : null}
+              {moveNote ? <span className="t-11 text-[var(--fg-4)]">{moveNote}</span> : null}
             </div>
+            <p className="t-11 leading-[17px] text-[var(--fg-4)]">
+              新建的图、片子、缓存都写在这里；改路径后旧文件不会自己搬——上面的「把现有产物搬过去」就是干这个的。
+              素材（参考视频 / 人脸图）放在 <span className="font-mono">{env?.inputDir || "安装目录\\input"}</span>，点
+              <button
+                type="button"
+                onClick={() => void api.openInExplorer(env?.inputDir || "")}
+                className="mx-0.5 underline decoration-dotted hover:text-[var(--fg-2)]"
+              >
+                这里打开
+              </button>
+              。
+            </p>
+            <details className="group rounded-[10px] bg-[var(--bg-2)] px-3 py-2">
+              <summary className="cursor-pointer t-11 text-[var(--fg-3)] marker:content-none hover:text-[var(--fg-1)]">
+                运行环境信息（一般不用看）
+              </summary>
+              <div className="mt-2 space-y-1 t-11 font-mono leading-[17px] text-[var(--fg-4)]">
+                <Path label="配置文件" value={env?.configPath} />
+                <Path
+                  label="程序目录"
+                  value={`${env?.productRoot || env?.projectRoot || ""}${
+                    env?.productRootAuto ? "（自动）" : ""
+                  }`}
+                />
+                <Path label="提示词" value={env?.promptsDir} />
+                <Path label="素材目录" value={env?.inputDir} />
+                <div className="flex gap-2">
+                  <span className="w-14 shrink-0 text-[var(--fg-3)]">ffmpeg</span>
+                  <span className={env?.ffmpegReady ? "text-[var(--ok)]" : "text-[var(--err)]"}>
+                    {env?.ffmpegReady ? "已就绪" : "缺失（拼接/抽帧不可用）"}
+                  </span>
+                </div>
+                <div className="flex gap-2">
+                  <span className="w-14 shrink-0 text-[var(--fg-3)]">提示词模板</span>
+                  <span className={env?.nodesInstalled ? "text-[var(--ok)]" : "text-[var(--err)]"}>
+                    {env?.nodesInstalled ? "已内置（目录里那份可改）" : "缺失"}
+                  </span>
+                </div>
+              </div>
+            </details>
           </Section>
 
           <Section title="项目存放位置" hint="一个项目一个文件夹">

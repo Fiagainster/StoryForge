@@ -9,6 +9,13 @@ export const setConfig = (patch: Partial<AppConfig>) =>
 
 export const envCheck = () => invoke<EnvReport>("env_check");
 
+/** 换产物目录时把旧目录的东西搬过去（不覆盖同名文件） */
+export const outputMigrate = (from: string, to: string) =>
+  invoke<{ from: string; to: string; moved: number; skipped: number; bytes: number }>(
+    "output_migrate",
+    { from, to }
+  );
+
 export const comfyStatus = () => invoke<ComfyStatus>("comfy_status");
 
 export const comfyStart = () => invoke<Record<string, unknown>>("comfy_start");

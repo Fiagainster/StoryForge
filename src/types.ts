@@ -39,6 +39,12 @@ export interface EnvReport {
   productRootAuto?: boolean;
   /** 提示词副本目录（模板已内置，这里只是可改的那份） */
   promptsDir?: string;
+  /** 产物目录（实际生效的绝对路径） */
+  outputDir?: string;
+  /** 产物目录是否被用户改过（false = 用的默认 安装目录\output） */
+  outputDirCustom?: boolean;
+  /** 素材目录（参考视频 / 人脸图） */
+  inputDir?: string;
   /** 工作区目录（原 ComfyUI base，产物仍在它的 output/ 下） */
   comfyDir: string;
   comfyBase: string;
@@ -220,8 +226,12 @@ export interface ChatSession {
 export interface AppConfig {
   /** v1 遗留字段，现在只做兼容读，不再参与目录判定 */
   projectRoot: string;
-  /** 程序自己的运行时目录；留空 = 自动（安装版用 AppData） */
+  /** 程序自己的运行时目录；留空 = 自动（安装目录，不可写时退到 AppData） */
   productRoot?: string;
+  /** 产物目录：留空 = 安装目录下的 output；填绝对路径可换盘 */
+  outputDir?: string;
+  /** 素材目录：留空 = 安装目录下的 input */
+  inputDir?: string;
   comfyDir: string;
   comfyBase: string;
   comfyPort: number;
